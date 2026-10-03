@@ -1359,7 +1359,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
 	}
-	IR::ValidateProgram(result, false);
+	if (IR::IrValidationEnabled()) {
+		IR::ValidateProgram(result, false);
+	}
 	return result;
 }
 
