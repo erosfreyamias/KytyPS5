@@ -137,6 +137,8 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
+    # Forks only build Windows.
+    if: github.repository == 'KytyPS5/KytyPS5'
     needs: metadata
     runs-on: macos-15
 
@@ -291,6 +293,8 @@ jobs:
 
   linux:
     name: Build KytyPS5 (Linux)
+    # Forks only build Windows.
+    if: github.repository == 'KytyPS5/KytyPS5'
     needs: metadata
     runs-on: ubuntu-24.04
 
