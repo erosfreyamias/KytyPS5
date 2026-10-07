@@ -384,6 +384,38 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed image table tracking was not transactional");
 }
 
+// PPSA03671 leaves a null SRT pointer in user data; the raw scalar reader must not dereference
+// the null page on the host. The GPU returns zero for that load, which is a null descriptor.
+void TestNullScalarPointerDescriptor() {
+  Fixture fixture;
+  const auto srt = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = word * 4u;
+    words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                               {srt, Value(0u), Value(0u), Value(true)},
+                               fixture.AddMemory(memory, 0x20));
+  }
+  const auto image = fixture.Image(words, 0x40);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x40));
+  fixture.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture.program);
+  const std::array<uint32_t, 2> user_data{0u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) &&
+            snapshot.images.size() == 1u &&
+            std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
+        "null SRT pointer did not materialize as a null image descriptor");
+}
+
 void TestBoundedImageViewEligibility() {
   using Type = Libs::Graphics::Prospero::ImageType;
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
@@ -3606,6 +3638,7 @@ int main() {
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("null scalar pointer descriptor", TestNullScalarPointerDescriptor);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);

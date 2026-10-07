@@ -526,7 +526,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		// The GPU returns zero for a scalar load from an unmapped page; a null SRT pointer then
+		// yields a null descriptor instead of faulting the host.
+		if (address >= SrtNullPageLimit) {
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		}
 	}
 	result = word;
 	return true;

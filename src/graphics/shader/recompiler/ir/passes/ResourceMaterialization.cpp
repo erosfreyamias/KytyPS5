@@ -161,6 +161,8 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 	auto& capture = *static_cast<ReadCapture*>(userdata);
 	if (capture.source.read_memory != nullptr) {
 		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
+	} else if (address < SrtNullPageLimit) {
+		std::ranges::fill(values, 0u);
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}

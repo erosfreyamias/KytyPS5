@@ -11,6 +11,11 @@ class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 
+// Raw reads (no reader callback) dereference guest addresses directly. No host or guest mapping
+// exists in the first 64 KiB, so such a read comes from an unset pointer and yields zero, as the
+// GPU's scalar load from an unmapped page does.
+constexpr uint64_t SrtNullPageLimit = 0x10000u;
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
