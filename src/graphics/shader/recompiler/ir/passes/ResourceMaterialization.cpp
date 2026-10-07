@@ -34,6 +34,19 @@ void PadMappingRegion(std::vector<uint32_t>& flattened_srt, size_t mapping_offse
 	flattened_srt.resize(mapping_offset + 1u + capacity, 0u);
 }
 
+// A large bindless table gains and loses entries as a game streams textures, and every count is a
+// different shader (its descriptor array length). Such tables are padded with copies of their last
+// entry up to a capacity with at most 25% slack; no key maps to the padding.
+constexpr size_t MinPaddedIndirectCandidates = 64;
+
+size_t IndirectCandidateCapacity(size_t count) {
+	if (count <= MinPaddedIndirectCandidates) {
+		return count;
+	}
+	const auto step = std::bit_floor(count) / 4u;
+	return (count + step - 1u) / step * step;
+}
+
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
@@ -276,6 +289,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& keys = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
+	const auto pad_candidates = [&] {
+		const auto capacity = std::min<size_t>(
+		    children_begin + IndirectCandidateCapacity(descriptors.size() - children_begin),
+		    maximum_resources);
+		if (descriptors.size() >= capacity) return;
+		const auto last       = descriptors.back();
+		const auto last_class = specializations.back();
+		descriptors.resize(capacity, last);
+		specializations.resize(capacity, last_class);
+	};
 	const auto intern_candidate = [&](const DescriptorValue& candidate, uint32_t& ordinal) {
 		ordinal = 0u;
 		if (candidate == descriptors[resource_index]) return true;
@@ -358,6 +381,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				snapshot.flattened_srt[mapping_offset] =
 				    static_cast<uint32_t>(snapshot.flattened_srt.size() - mapping_offset - 1u);
 				PadMappingRegion(snapshot.flattened_srt, mapping_offset, 1u);
+				pad_candidates();
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
 				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
@@ -464,6 +488,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
 		PadMappingRegion(snapshot.flattened_srt, mapping_offset, 2u);
+		pad_candidates();
 		// Extra iterations are inactive once the runtime range is empty; size them to capacity.
 		const auto capacity = (snapshot.flattened_srt.size() - mapping_offset - 1u) / 2u;
 		auto& root                      = specializations[resource_index];

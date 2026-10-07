@@ -1100,6 +1100,35 @@ void TestBoundedComputeImageLoop() {
   user_data[2] = 65537u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "oversized compute loop bound was accepted for image enumeration");
+
+  // PPSA03671 streams textures into a table of hundreds of entries. Large tables pad their
+  // candidates to a capacity bucket, so a few more entries reuse the same shader variant.
+  for (uint32_t key = 3u; key < 120u; ++key) {
+    const auto word = (table - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  user_data[2] = 100u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 1u + 112u && specialization.images.size() == 1u + 112u &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 100u &&
+            snapshot.images[99].dwords[0] == 0x100u + 99u &&
+            snapshot.images.back().dwords == snapshot.images[99].dwords,
+        "large image table was not padded with its last candidate to a capacity bucket");
+  const auto bucketed = specialization;
+  user_data[2] = 105u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization == bucketed &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 105u &&
+            snapshot.images[104].dwords[0] == 0x100u + 104u,
+        "growing a large image table within its bucket changed the shader variant");
+  user_data[2] = 120u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 1u + 128u,
+        "large image table did not move to the next capacity bucket");
 }
 
 void TestUniformizedMaterialImageKeys() {
