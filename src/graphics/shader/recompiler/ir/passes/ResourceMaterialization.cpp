@@ -22,6 +22,18 @@ namespace {
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
 
+// Mapping regions and search depths are baked into the shader. Rounding a table's region up to
+// a power-of-two capacity keeps them, and every later region's offset, stable while a streaming
+// game grows or shrinks the table, so the same shader variant is reused instead of recompiled.
+// The header still holds the real entry count, so padding is never searched.
+void PadMappingRegion(std::vector<uint32_t>& flattened_srt, size_t mapping_offset,
+                      size_t entry_words) {
+	const auto used = flattened_srt.size() - mapping_offset - 1u;
+	const auto capacity =
+	    std::bit_ceil(std::max<size_t>((used + entry_words - 1u) / entry_words, 4u)) * entry_words;
+	flattened_srt.resize(mapping_offset + 1u + capacity, 0u);
+}
+
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
@@ -345,6 +357,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			} else {
 				snapshot.flattened_srt[mapping_offset] =
 				    static_cast<uint32_t>(snapshot.flattened_srt.size() - mapping_offset - 1u);
+				PadMappingRegion(snapshot.flattened_srt, mapping_offset, 1u);
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
 				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
@@ -450,10 +463,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+		PadMappingRegion(snapshot.flattened_srt, mapping_offset, 2u);
+		// Extra iterations are inactive once the runtime range is empty; size them to capacity.
+		const auto capacity = (snapshot.flattened_srt.size() - mapping_offset - 1u) / 2u;
 		auto& root                      = specializations[resource_index];
 		root.indirect_root              = resource_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(key_count);
+		root.indirect_search_iterations = std::bit_width(capacity);
 	}
 	return true;
 }

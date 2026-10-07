@@ -444,6 +444,11 @@ void TestBoundedImageViewEligibility() {
             snapshot.images.size() == 4u && memory.reads == 1u,
         "unrelated cube/3D heap entries prevented a typed 2D table view");
   const auto mapping = specialization.images[0].indirect_mapping_offset;
+  // The 53-word direct table reserves a 64-word region, so a streaming table can grow or shrink
+  // within that capacity without moving later regions or changing the shader.
+  Check(snapshot.flattened_srt.size() == mapping + 1u + 64u &&
+            specialization.images[0].indirect_search_iterations == 0u,
+        "indirect key region was not padded to a stable capacity");
   Check(snapshot.flattened_srt[mapping] == 53u &&
             snapshot.flattened_srt[mapping + 5u] == 1u &&
             snapshot.flattened_srt[mapping + 17u] == 0u &&
@@ -752,6 +757,10 @@ void TestGuardedDirectImageTable() {
             snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
+  Check(snapshot.flattened_srt.size() ==
+                specialization.images[0].indirect_mapping_offset + 1u + 32u * 2u &&
+            specialization.images[0].indirect_search_iterations == std::bit_width(32u),
+        "searched key region did not reserve a power-of-two capacity and depth");
   const auto captured_word = (table - memory.base) / 4u + 16u * 8u;
   const auto original_descriptor = snapshot.images[16].dwords;
   const std::array<uint32_t, 8> captured_invalid{
