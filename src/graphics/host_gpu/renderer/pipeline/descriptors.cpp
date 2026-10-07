@@ -807,6 +807,21 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
+// Specialization snapshots its scalar reads before the dispatch, which is what each wave sees
+// on hardware unless the dispatch rewrites those exact bytes first. Whole-buffer write ranges
+// cannot tell those cases apart (GPU-driven engines read and write one large buffer), so an
+// overlap keeps the pre-dispatch values and is reported once instead of aborting.
+static void WarnSpecializationReadOverlap(uint64_t read_address, uint64_t read_size,
+                                          uint64_t write_address, uint64_t write_size) {
+	static std::atomic_bool warned = false;
+	if (!warned.exchange(true, std::memory_order_relaxed)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Warning: scalar resource reads [0x{:x}, +0x{:x}) overlap a shader buffer write "
+		    "[0x{:x}, +0x{:x}); specializing on pre-dispatch values.\n",
+		    read_address, read_size, write_address, write_size));
+	}
+}
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
@@ -839,7 +854,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
 							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
+								WarnSpecializationReadOverlap(read_address, read_size, address, size);
 							}
 						}
 					}
@@ -1033,7 +1048,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[i];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						WarnSpecializationReadOverlap(address, size, written.address, written.size);
 					}
 				}
 			}
