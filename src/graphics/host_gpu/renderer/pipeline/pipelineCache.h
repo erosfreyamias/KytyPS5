@@ -181,7 +181,7 @@ private:
 	// the next boot from recompiling everything this session already built.
 	uint32_t                              m_unsaved_pipelines = 0;
 	std::chrono::steady_clock::time_point m_last_snapshot     = std::chrono::steady_clock::now();
-	std::atomic_bool                      m_writer_busy = false;
+	std::atomic_bool                      m_writer_busy       = false;
 	std::jthread                          m_writer;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
