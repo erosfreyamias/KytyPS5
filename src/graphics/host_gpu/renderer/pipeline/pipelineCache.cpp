@@ -24,6 +24,8 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -102,6 +104,15 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
 	message += '\n';
 	Log::WriteToConsoleAndLog(message);
+}
+
+using ShaderClock = std::chrono::steady_clock;
+
+// Shader and pipeline builds run on the GPU thread, so each slow one is a visible stall.
+constexpr auto SlowShaderThreshold = std::chrono::milliseconds(100);
+
+double ShaderMs(ShaderClock::duration duration) {
+	return std::chrono::duration<double, std::milli>(duration).count();
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
@@ -258,8 +269,11 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
+		const auto recompile_start = ShaderClock::now();
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		last_timing.recompile   = ShaderClock::now() - recompile_start;
+		last_timing.spirv_words = result.spirv.size();
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
@@ -267,7 +281,9 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		const auto module = CompileSPV(result.spirv, device);
+		const auto module_start = ShaderClock::now();
+		const auto module       = CompileSPV(result.spirv, device);
+		last_timing.module      = ShaderClock::now() - module_start;
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
@@ -369,7 +385,9 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		const auto translate_start = ShaderClock::now();
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		const auto translate_time  = ShaderClock::now() - translate_start;
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
@@ -382,6 +400,13 @@ struct PipelineCache::ProgramCache {
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		if (translate_time + last_timing.recompile + last_timing.module >= SlowShaderThreshold) {
+			std::printf("Slow shader %s id=%" PRIu64 " hash=%016" PRIx64
+			            ": translate %.0f ms, recompile %.0f ms, module %.0f ms, SPIR-V %zu words\n",
+			            stage_name, permutation.handle.id, params.hash, ShaderMs(translate_time),
+			            ShaderMs(last_timing.recompile), ShaderMs(last_timing.module),
+			            last_timing.spirv_words);
+		}
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [key, source]: programs) {
@@ -411,8 +436,15 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	struct CompileTiming {
+		ShaderClock::duration recompile {};
+		ShaderClock::duration module {};
+		size_t                spirv_words = 0;
+	};
+
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
+	CompileTiming                                               last_timing;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
 };
@@ -947,9 +979,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto pipeline_start = ShaderClock::now();
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	if (const auto elapsed = ShaderClock::now() - pipeline_start; elapsed >= SlowShaderThreshold) {
+		std::printf("Slow pipeline graphics vs=%" PRIu64 " ps=%" PRIu64 ": driver %.0f ms\n", vs_id,
+		            ps_id, ShaderMs(elapsed));
+	}
 	OnPipelineCreated();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -979,7 +1016,12 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	const auto pipeline_start = ShaderClock::now();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	if (const auto elapsed = ShaderClock::now() - pipeline_start; elapsed >= SlowShaderThreshold) {
+		std::printf("Slow pipeline cs id=%" PRIu64 ": driver %.0f ms\n", compute_program.id,
+		            ShaderMs(elapsed));
+	}
 	OnPipelineCreated();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
