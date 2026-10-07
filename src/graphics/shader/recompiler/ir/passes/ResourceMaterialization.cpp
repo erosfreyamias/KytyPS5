@@ -14,6 +14,8 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -34,18 +36,31 @@ void PadMappingRegion(std::vector<uint32_t>& flattened_srt, size_t mapping_offse
 	flattened_srt.resize(mapping_offset + 1u + capacity, 0u);
 }
 
-// A large bindless table gains and loses entries as a game streams textures, and every count is a
-// different shader (its descriptor array length). Such tables are padded with copies of their last
-// entry up to a capacity with at most 25% slack; no key maps to the padding.
+// A large bindless table gains, loses and reorders entries as a game streams textures, and every
+// count or type order is a different shader (descriptor array lengths and per-candidate classes).
+// Such tables group their candidates by class and pad each group with copies of its last entry up
+// to a capacity bucket; no key maps to the padding.
 constexpr size_t MinPaddedIndirectCandidates = 64;
 
-size_t IndirectCandidateCapacity(size_t count) {
+// Small groups round to a power of two; large ones to a quarter of their leading power of two,
+// keeping slack at or below 25%.
+size_t IndirectGroupCapacity(size_t count) {
 	if (count <= MinPaddedIndirectCandidates) {
-		return count;
+		return std::bit_ceil(count);
 	}
 	const auto step = std::bit_floor(count) / 4u;
 	return (count + step - 1u) / step * step;
 }
+
+struct DescriptorValueHash {
+	size_t operator()(const DescriptorValue& value) const {
+		uint64_t hash = 0xcbf29ce484222325ull ^ value.dword_count;
+		for (const auto word: value.dwords) {
+			hash = (hash ^ word) * 0x100000001b3ull;
+		}
+		return static_cast<size_t>(hash);
+	}
+};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -158,6 +173,25 @@ uint32_t ImageMipCount(const ImageResource& image, const DescriptorValue& descri
 	const auto base = (descriptor.dwords[3] >> 12u) & 0xfu;
 	const auto last = (descriptor.dwords[3] >> 16u) & 0xfu;
 	return base <= last ? last - base + 1u : 0u;
+}
+
+// Everything BuildResourceSpecialization derives per candidate, so equal keys specialize equally.
+uint64_t IndirectCandidateClass(const ImageResource& base, const DescriptorValue& descriptor) {
+	if (NullImageDescriptor(descriptor)) {
+		return 0;
+	}
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	const auto conversion = ImageConversionFormat(format);
+	const bool swizzled   = base.resource_class == ImageResourceClass::Storage ||
+	                      conversion != Prospero::BufferFormat::kInvalid;
+	return (uint64_t {static_cast<uint32_t>(Prospero::SampledTextureNumericClass(format)) + 1u}
+	        << 60u) |
+	       (uint64_t {static_cast<uint32_t>(DescriptorDimension(descriptor, base.dimension))} << 56u) |
+	       (uint64_t {DescriptorIsCube(descriptor)} << 55u) |
+	       (uint64_t {Prospero::IsFmaskTextureFormat(format)} << 54u) |
+	       (uint64_t {static_cast<uint32_t>(conversion) & 0x1ffu} << 45u) |
+	       (uint64_t {ImageMipCount(base, descriptor) & 0x1fffu} << 32u) |
+	       (swizzled ? DescriptorImageSwizzle(descriptor) : 0u);
 }
 
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
@@ -289,22 +323,53 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	auto& keys = program.material_keys;
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
-	const auto pad_candidates = [&] {
-		const auto capacity = std::min<size_t>(
-		    children_begin + IndirectCandidateCapacity(descriptors.size() - children_begin),
-		    maximum_resources);
-		if (descriptors.size() >= capacity) return;
-		const auto last       = descriptors.back();
-		const auto last_class = specializations.back();
-		descriptors.resize(capacity, last);
-		specializations.resize(capacity, last_class);
+	std::unordered_map<DescriptorValue, uint32_t, DescriptorValueHash> interned;
+	// Returns each old ordinal's new ordinal, or nothing when the table keeps its order.
+	const auto group_candidates = [&]() -> std::vector<uint32_t> {
+		if constexpr (!std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+			return {};
+		} else {
+			const auto children = descriptors.size() - children_begin;
+			if (children <= MinPaddedIndirectCandidates || resource_index >= program.info.images.size()) {
+				return {};
+			}
+			const auto& base = program.info.images[resource_index];
+			std::vector<std::pair<uint64_t, uint32_t>> order(children);
+			for (uint32_t child = 0; child < children; ++child) {
+				order[child] = {IndirectCandidateClass(base, descriptors[children_begin + child]), child};
+			}
+			std::ranges::stable_sort(order, {}, &std::pair<uint64_t, uint32_t>::first);
+			std::vector<DescriptorValue> grouped;
+			grouped.reserve(children + children / 4u + order.size());
+			std::vector<uint32_t> remap(children + 1u, 0u);
+			for (size_t first = 0; first < order.size();) {
+				auto last = first;
+				for (; last < order.size() && order[last].first == order[first].first; ++last) {
+					remap[order[last].second + 1u] = static_cast<uint32_t>(grouped.size() + 1u);
+					grouped.push_back(descriptors[children_begin + order[last].second]);
+				}
+				const auto padding = grouped.back();
+				grouped.resize(grouped.size() - (last - first) + IndirectGroupCapacity(last - first),
+				               padding);
+				first = last;
+			}
+			if (children_begin + grouped.size() > maximum_resources) {
+				return {};
+			}
+			descriptors.resize(children_begin);
+			descriptors.insert(descriptors.end(), grouped.begin(), grouped.end());
+			const auto child = specializations.back();
+			specializations.resize(descriptors.size(), child);
+			return remap;
+		}
 	};
 	const auto intern_candidate = [&](const DescriptorValue& candidate, uint32_t& ordinal) {
 		ordinal = 0u;
 		if (candidate == descriptors[resource_index]) return true;
-		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-		ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-		if (found == descriptors.end()) {
+		const auto [found, inserted] = interned.try_emplace(
+		    candidate, static_cast<uint32_t>(descriptors.size() - children_begin + 1u));
+		ordinal = found->second;
+		if (inserted) {
 			if (descriptors.size() >= maximum_resources) return false;
 			descriptors.push_back(candidate);
 			auto child = root_resource;
@@ -380,8 +445,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			} else {
 				snapshot.flattened_srt[mapping_offset] =
 				    static_cast<uint32_t>(snapshot.flattened_srt.size() - mapping_offset - 1u);
+				if (const auto remap = group_candidates(); !remap.empty()) {
+					for (auto it = snapshot.flattened_srt.begin() + mapping_offset + 1u;
+					     it != snapshot.flattened_srt.end(); ++it) {
+						*it = remap[*it];
+					}
+				}
 				PadMappingRegion(snapshot.flattened_srt, mapping_offset, 1u);
-				pad_candidates();
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
 				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
@@ -487,8 +557,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+		if (const auto remap = group_candidates(); !remap.empty()) {
+			for (uint32_t entry = 0; entry < key_count; ++entry) {
+				auto& ordinal = snapshot.flattened_srt[mapping_offset + 2u + entry * 2u];
+				ordinal       = remap[ordinal];
+			}
+		}
 		PadMappingRegion(snapshot.flattened_srt, mapping_offset, 2u);
-		pad_candidates();
 		// Extra iterations are inactive once the runtime range is empty; size them to capacity.
 		const auto capacity = (snapshot.flattened_srt.size() - mapping_offset - 1u) / 2u;
 		auto& root                      = specializations[resource_index];

@@ -1129,6 +1129,38 @@ void TestBoundedComputeImageLoop() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 1u + 128u,
         "large image table did not move to the next capacity bucket");
+
+  // Large tables group candidates by class, so a cube texture streaming into a different slot
+  // keeps the shader variant while every key still selects its own descriptor.
+  const auto set_type = [&](uint32_t key, Libs::Graphics::Prospero::ImageType type) {
+    const auto word = (table - memory.base) / 4u + key * 8u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(type) << 28u);
+  };
+  const auto selects_own_descriptor = [&](uint32_t count) {
+    const auto mapping = specialization.images[0].indirect_mapping_offset;
+    for (uint32_t key = 0; key < count; ++key) {
+      // Ordinal 0 is the root at image 0; children follow it in order.
+      const auto ordinal = snapshot.flattened_srt[mapping + 2u + key * 2u];
+      if (snapshot.flattened_srt[mapping + 1u + key * 2u] != key ||
+          snapshot.images[ordinal].dwords[0] != 0x100u + key) {
+        return false;
+      }
+    }
+    return true;
+  };
+  user_data[2] = 100u;
+  set_type(50u, Libs::Graphics::Prospero::ImageType::kCube);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            selects_own_descriptor(100u),
+        "grouped large image table mapped a key to another candidate");
+  const auto grouped = specialization;
+  set_type(50u, Libs::Graphics::Prospero::ImageType::kColor2D);
+  set_type(60u, Libs::Graphics::Prospero::ImageType::kCube);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            selects_own_descriptor(100u) && specialization == grouped,
+        "moving a cube texture within a large image table changed the shader variant");
+  set_type(60u, Libs::Graphics::Prospero::ImageType::kColor2D);
 }
 
 void TestUniformizedMaterialImageKeys() {
