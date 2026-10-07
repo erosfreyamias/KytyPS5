@@ -115,6 +115,64 @@ double ShaderMs(ShaderClock::duration duration) {
 	return std::chrono::duration<double, std::milli>(duration).count();
 }
 
+// Lists what made a source need another variant, so variant churn can be traced to its cause.
+std::string DescribeSpecializationChange(const ShaderRecompiler::IR::ResourceSpecialization& from,
+                                         const ShaderRecompiler::IR::ResourceSpecialization& to) {
+	constexpr size_t MaxChanges = 6;
+	std::string      text;
+	size_t           changes = 0;
+	const auto       note    = [&](const std::string& change) {
+		if (changes++ < MaxChanges) {
+			text += text.empty() ? "" : ", ";
+			text += change;
+		}
+	};
+	const auto field = [&](const char* kind, size_t index, const char* name, uint64_t a, uint64_t b) {
+		if (a != b) {
+			note(fmt::format("{}[{}].{} {}->{}", kind, index, name, a, b));
+		}
+	};
+	if (from.buffers.size() != to.buffers.size()) {
+		note(fmt::format("buffers {}->{}", from.buffers.size(), to.buffers.size()));
+	}
+	for (size_t i = 0; i < std::min(from.buffers.size(), to.buffers.size()); i++) {
+		const auto& a = from.buffers[i];
+		const auto& b = to.buffers[i];
+		field("buffers", i, "stride", a.packed_stride, b.packed_stride);
+		field("buffers", i, "format", static_cast<uint64_t>(a.descriptor_format),
+		      static_cast<uint64_t>(b.descriptor_format));
+		field("buffers", i, "swizzle", a.descriptor_swizzle, b.descriptor_swizzle);
+		field("buffers", i, "zero_stride_oob", a.zero_stride_oob, b.zero_stride_oob);
+		field("buffers", i, "root", a.indirect_root, b.indirect_root);
+		field("buffers", i, "mapping", a.indirect_mapping_offset, b.indirect_mapping_offset);
+		field("buffers", i, "search", a.indirect_search_iterations, b.indirect_search_iterations);
+	}
+	if (from.images.size() != to.images.size()) {
+		note(fmt::format("images {}->{}", from.images.size(), to.images.size()));
+	}
+	for (size_t i = 0; i < std::min(from.images.size(), to.images.size()); i++) {
+		const auto& a = from.images[i];
+		const auto& b = to.images[i];
+		field("images", i, "class", static_cast<uint64_t>(a.numeric_class),
+		      static_cast<uint64_t>(b.numeric_class));
+		field("images", i, "dim", static_cast<uint64_t>(a.dimension),
+		      static_cast<uint64_t>(b.dimension));
+		field("images", i, "mips", a.mip_count, b.mip_count);
+		field("images", i, "conversion", static_cast<uint64_t>(a.conversion_format),
+		      static_cast<uint64_t>(b.conversion_format));
+		field("images", i, "swizzle", a.shader_swizzle, b.shader_swizzle);
+		field("images", i, "root", a.indirect_root, b.indirect_root);
+		field("images", i, "mapping", a.indirect_mapping_offset, b.indirect_mapping_offset);
+		field("images", i, "search", a.indirect_search_iterations, b.indirect_search_iterations);
+		field("images", i, "cube", a.cube, b.cube);
+		field("images", i, "fmask", a.fmask, b.fmask);
+	}
+	if (changes > MaxChanges) {
+		text += fmt::format(" (+{} more)", changes - MaxChanges);
+	}
+	return text.empty() ? "push data layout" : text;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -383,6 +441,13 @@ struct PipelineCache::ProgramCache {
 			}
 		} else {
 			options.wave_size = input_info.wave_size;
+		}
+		if (entry != programs.end() && !entry->second.permutations.empty()) {
+			std::printf("Shader variant %s hash=%016" PRIx64 " #%zu: %s\n", stage_name, params.hash,
+			            entry->second.permutations.size() + 1u,
+			            DescribeSpecializationChange(entry->second.permutations.back().specialization,
+			                                         entry->second.specialization)
+			                .c_str());
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		const auto translate_start = ShaderClock::now();
