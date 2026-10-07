@@ -30,6 +30,7 @@
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -424,6 +425,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 
 PipelineCache::~PipelineCache() {
 	Save();
+	WaitForWriter();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -525,11 +527,37 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
-void PipelineCache::Save() {
-	if (m_driver_cache == nullptr) {
-		return;
-	}
+namespace {
 
+// Snapshots are throttled so a burst of new pipelines (a new area loading) costs at most one
+// cache read and one background file write per interval.
+constexpr auto DriverCacheSnapshotInterval = std::chrono::seconds(30);
+
+bool WriteDriverCacheFile(const std::filesystem::path& cache_path, const std::string& data) {
+	if (!Common::File::CreateDirectories(cache_path.parent_path())) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+		return false;
+	}
+	auto temp_path = cache_path;
+	temp_path += ".tmp";
+	Common::File file;
+	uint32_t     written = 0;
+	if (file.Create(temp_path)) {
+		file.Write(data.data(), static_cast<uint32_t>(data.size()), &written);
+	}
+	const bool flushed = !file.IsInvalid() && file.Flush();
+	file.Close();
+	if (written != data.size() || !flushed || !Common::File::RenameFile(temp_path, cache_path)) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
+		                 Common::PathToString(cache_path));
+		return false;
+	}
+	return true;
+}
+
+} // namespace
+
+bool PipelineCache::SnapshotDriverCache(std::string* data) {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
@@ -550,37 +578,77 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	*data                   = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
-	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+	data->append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	data->append(reinterpret_cast<const char*>(payload.data()), payload.size());
+	if (data->size() > std::numeric_limits<uint32_t>::max()) {
+		PipelineCacheLog("Vulkan pipeline cache: save failed (cache too large)");
+		return false;
+	}
+	return true;
+}
+
+void PipelineCache::WaitForWriter() {
+	if (m_writer.joinable()) {
+		m_writer.join();
+	}
+}
+
+void PipelineCache::WriteDriverCacheAsync(std::string data) {
+	WaitForWriter();
+	m_writer_busy.store(true, std::memory_order_release);
+	m_writer = std::jthread([this, path = m_driver_cache_path, data = std::move(data)] {
+		if (WriteDriverCacheFile(path, data)) {
+			PipelineCacheLog("Vulkan pipeline cache: checkpoint {} bytes to {}", data.size(),
+			                 Common::PathToString(path));
+		}
+		m_writer_busy.store(false, std::memory_order_release);
+	});
+}
+
+void PipelineCache::OnPipelineCreated() {
+	if (m_driver_cache != nullptr) {
+		m_unsaved_pipelines++;
+		CheckpointDriverCache();
+	}
+}
+
+void PipelineCache::CheckpointDriverCache() {
+	if (m_unsaved_pipelines == 0 || m_driver_cache == nullptr) {
 		return;
 	}
-	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
-	Common::File file;
-	uint32_t     prefix_written  = 0;
-	uint32_t     payload_written = 0;
-	if (file.Create(temp_path)) {
-		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
-	}
-	const bool flushed = !file.IsInvalid() && file.Flush();
-	file.Close();
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
-		                 Common::PathToString(m_driver_cache_path));
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_snapshot < DriverCacheSnapshotInterval ||
+	    m_writer_busy.load(std::memory_order_acquire)) {
 		return;
 	}
-	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
+	m_last_snapshot = now;
+	std::string data;
+	if (SnapshotDriverCache(&data)) {
+		m_unsaved_pipelines = 0;
+		WriteDriverCacheAsync(std::move(data));
+	}
+}
+
+void PipelineCache::Save() {
+	if (m_driver_cache == nullptr) {
+		return;
+	}
+	WaitForWriter();
+
+	std::string data;
+	if (!SnapshotDriverCache(&data) || !WriteDriverCacheFile(m_driver_cache_path, data)) {
+		return;
+	}
+	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", data.size(),
 	                 Common::PathToString(m_driver_cache_path));
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	m_driver_cache      = nullptr;
+	m_unsaved_pipelines = 0;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -863,6 +931,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		CheckpointDriverCache();
 		return *iter->second;
 	}
 
@@ -881,6 +950,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+	OnPipelineCreated();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
@@ -900,6 +970,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		CheckpointDriverCache();
 		return *iter->second;
 	}
 
@@ -909,6 +980,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto cached = std::make_unique<Pipeline>();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	OnPipelineCreated();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
