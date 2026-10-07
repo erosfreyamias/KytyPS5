@@ -423,6 +423,40 @@ void TestBoundedImageViewEligibility() {
             snapshot.images[3].dwords == descriptor(0x24u, Type::kColor2D),
         "typed table eligibility changed byte offsets or discarded compatible views");
 
+  // A table may mix float and integer textures (PPSA03671 samples one RGBA8 UNorm and one R32
+  // UInt view through the same instruction). Each candidate keeps its own numeric class and
+  // gets a sampler variant of its own filtering class.
+  {
+    using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
+    constexpr uint32_t unorm_row = 4u;
+    auto unorm = descriptor(0x24u, Type::kColor2D);
+    unorm[1] = static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm) << 20u;
+    std::copy(unorm.begin(), unorm.end(),
+              memory.words.begin() + (0x1010u + unorm_row * 48u) / 4u);
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              specialization.images.size() == 4u &&
+              specialization.images[1].numeric_class == NumericClass::Uint &&
+              specialization.images[3].numeric_class == NumericClass::Float &&
+              specialization.images[3].indirect_root == 0u,
+          "mixed numeric class image table was rejected or lost a candidate class");
+    ApplyResourceSpecialization(fixture->program, specialization);
+    const auto &info = fixture->program.info;
+    Check(info.sampled_pairs.size() == 1u,
+          "mixed numeric class image table changed its sampled pairs");
+    const auto sampler = info.sampled_pairs[0].sampler;
+    const auto uint_sampler = SamplerForImage(info, sampler, info.images[1]);
+    const auto float_sampler = SamplerForImage(info, sampler, info.images[3]);
+    Check(uint_sampler != UINT32_MAX && float_sampler != UINT32_MAX &&
+              uint_sampler != float_sampler && info.samplers[uint_sampler].integer_border &&
+              !info.samplers[float_sampler].integer_border &&
+              info.samplers[uint_sampler].snapshot_index ==
+                  info.samplers[float_sampler].snapshot_index,
+          "mixed numeric class image table did not get per-class sampler variants");
+    const auto restore = descriptor(0x24u, Type::kColor2D);
+    std::copy(restore.begin(), restore.end(),
+              memory.words.begin() + (0x1010u + unorm_row * 48u) / 4u);
+  }
+
   // An explicitly selected descriptor is not an unrelated entry in a broad heap.
   const auto image_source = plan.info.images[0].source;
   std::vector<uint32_t> selected;

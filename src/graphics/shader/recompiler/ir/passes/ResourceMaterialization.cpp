@@ -639,14 +639,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
-			// The emitter unpacks each candidate with its own conversion format and swizzle, so
-			// those may differ; the shared sampler, result type and coordinates may not.
+			// The emitter samples, unpacks and bit-casts each candidate with its own numeric
+			// class, sampler class, conversion format and swizzle, so those may differ; the
+			// shared coordinates and mip selection may not.
 			const char* mismatch = nullptr;
-			if (image.numeric_class != image_class.numeric_class) {
-				mismatch = "numeric class";
-			} else if (ClassifySampler(image) != ClassifySampler(image_class)) {
-				mismatch = "sampler class";
-			} else if (!same_coordinates &&
+			if (!same_coordinates &&
 			           !(is_2d(image.dimension) && is_2d(image_class.dimension))) {
 				mismatch = "dimension";
 			} else if (image.mip_count != image_class.mip_count) {
@@ -682,7 +679,16 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 		if (pair.image >= base.images.size() || pair.sampler >= base.samplers.size()) {
 			return false;
 		}
-		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image]));
+		const auto& image = base.images[pair.image];
+		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(image));
+		// Indirect candidates are sampled through the pair's sampler with their own class.
+		for (const auto candidate: image.indirect_resources) {
+			if (candidate >= base.images.size()) {
+				return false;
+			}
+			usage[pair.sampler] |=
+			    1u << static_cast<uint32_t>(ClassifySampler(base.images[candidate]));
+		}
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];
@@ -699,6 +705,31 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 		}
 	}
 	return true;
+}
+
+uint32_t SamplerForImage(const ShaderInfo& info, uint32_t sampler, const ImageResource& image) {
+	if (sampler >= info.samplers.size()) {
+		return UINT32_MAX;
+	}
+	const auto  type    = ClassifySampler(image);
+	const bool  point   = type == SamplerClass::PointInteger;
+	const bool  integer = type != SamplerClass::Float;
+	const auto& current = info.samplers[sampler];
+	const auto  matches = [&](const SamplerResource& candidate) {
+		return candidate.snapshot_index == current.snapshot_index &&
+		       candidate.force_point_filtering == point && candidate.integer_border == integer &&
+		       candidate.depth_compare == current.depth_compare &&
+		       candidate.gather_lod == current.gather_lod;
+	};
+	if (matches(current)) {
+		return sampler;
+	}
+	for (uint32_t index = 0; index < info.samplers.size(); index++) {
+		if (matches(info.samplers[index])) {
+			return index;
+		}
+	}
+	return UINT32_MAX;
 }
 
 template <typename Predicate>

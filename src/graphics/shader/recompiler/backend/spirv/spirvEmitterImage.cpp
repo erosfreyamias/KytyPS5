@@ -811,15 +811,24 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
+		// Indirect candidates may need a sampler variant of a different filtering class.
+		std::vector<uint32_t> candidate_samplers;
 		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
 			const auto& candidate = state.program.info.images[resource];
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
-			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
+			auto candidate_sampler = sampler_id;
+			if (resource < candidate_samplers.size() && candidate_samplers[resource] != mem.sampler) {
+				candidate_sampler = LoadSamplerDescriptor(state, candidate_samplers[resource]);
+			}
+			const auto sampled =
+			    MakeSampledImage(state, resource, candidate_sampler, 0u, array_index);
+			const auto sample_type =
+			    dref ? result_type : ImageVectorType(state, candidate.numeric_class, 4);
 			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
+			std::vector<uint32_t> sample_operands {sample_type, sample, sampled, coord};
 			if (dref) {
 				sample_operands.push_back(dref_value);
 			}
@@ -861,6 +870,16 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "uses depth comparison with a converted indirect image");
 			return;
 		}
+		candidate_samplers.assign(state.program.info.images.size(), mem.sampler);
+		for (const auto resource: image.indirect_resources) {
+			const auto sampler =
+			    IR::SamplerForImage(state.program.info, mem.sampler, state.program.info.images[resource]);
+			if (sampler == UINT32_MAX) {
+				ctx.Fail(inst, "has no sampler variant for an indirect image candidate");
+				return;
+			}
+			candidate_samplers[resource] = sampler;
+		}
 		const auto selected = EmitIndirectResourceIndex(
 		    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
 		struct SampleRun {
@@ -880,6 +899,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto& first = state.program.info.images[run.resource];
 				const auto next_slot = run.slot_bias + ordinal;
 				if (candidate.dimension == first.dimension && candidate.cube == first.cube &&
+				    candidate.numeric_class == first.numeric_class &&
 				    candidate.conversion_format == first.conversion_format &&
 				    candidate.shader_swizzle == first.shader_swizzle &&
 				    IR::DescriptorBindingForImage(first) == kind &&
@@ -924,21 +944,25 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                          ConstantU32(state, index), run_index);
 			run_index = next;
 		}
-		// Candidates may differ in conversion format and swizzle, so each run unpacks its own
-		// texels; materialization guarantees they share the unpacked result type.
-		const auto EmitUnpackedRun = [&](uint32_t index) {
-			const auto sample = EmitRun(index);
-			if (dref) return sample;
-			auto run_mem     = mem;
-			run_mem.resource = runs[index].resource;
-			return UnpackImageTexel(ctx, run_mem, sample);
+		// Candidates may differ in numeric class, conversion format and swizzle. Each run
+		// unpacks its own texels and returns the raw result bits, as the guest's sample
+		// instruction would for that descriptor, so the runs merge as one uvec4 type.
+		const auto EmitResultRun = [&](uint32_t index) {
+			auto        sample    = EmitRun(index);
+			const auto& candidate = state.program.info.images[runs[index].resource];
+			if (!dref) {
+				auto run_mem     = mem;
+				run_mem.resource = runs[index].resource;
+				sample           = UnpackImageTexel(ctx, run_mem, sample);
+			}
+			return ResultVector(ctx, sample, candidate.numeric_class, dref, mem);
 		};
 		const auto result = runs.size() == 1u
-		                        ? EmitUnpackedRun(0u)
+		                        ? EmitResultRun(0u)
 		                        : EmitIndexSwitch(state, run_index,
-		                                          static_cast<uint32_t>(runs.size()), result_type,
-		                                          EmitUnpackedRun);
-		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+		                                          static_cast<uint32_t>(runs.size()),
+		                                          TypeU32Vector(state, 4), EmitResultRun);
+		ctx.Define(inst, result);
 		return;
 	}
 	if (image_info.access == IR::ImageAccess::Atomic) {
