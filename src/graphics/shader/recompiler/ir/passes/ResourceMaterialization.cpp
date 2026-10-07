@@ -109,7 +109,9 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 
 enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
 
-SamplerClass ClassifySampler(const ImageResource& image) {
+// Accepts both ImageResource and ResourceSpecialization::Image.
+template <typename ImageT>
+SamplerClass ClassifySampler(const ImageT& image) {
 	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	    (image.numeric_class == Prospero::TextureNumericClass::Uint &&
 	     image.conversion_format != Prospero::BufferFormat::kInvalid)) {
@@ -637,14 +639,32 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
-			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
-			    image.mip_count != image_class.mip_count ||
-			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+			// The emitter unpacks each candidate with its own conversion format and swizzle, so
+			// those may differ; the shared sampler, result type and coordinates may not.
+			const char* mismatch = nullptr;
+			if (image.numeric_class != image_class.numeric_class) {
+				mismatch = "numeric class";
+			} else if (ClassifySampler(image) != ClassifySampler(image_class)) {
+				mismatch = "sampler class";
+			} else if (!same_coordinates &&
+			           !(is_2d(image.dimension) && is_2d(image_class.dimension))) {
+				mismatch = "dimension";
+			} else if (image.mip_count != image_class.mip_count) {
+				mismatch = "mip count";
+			}
+			if (mismatch != nullptr) {
+				const auto format = [&](uint32_t index) {
+					return (snapshot.images[index].dwords[1] >> 20u) & 0x1ffu;
+				};
+				return SpecializationFail(fmt::format(
+				    "indirect image table at pc 0x{:08x} has incompatible candidates: {} differs "
+				    "(candidate {} format {} class {} dim {} mips {}, exemplar {} format {} class "
+				    "{} dim {} mips {})",
+				    program.info.images[root_index].first_use_pc, mismatch, candidate,
+				    format(candidate), static_cast<uint32_t>(image.numeric_class),
+				    static_cast<uint32_t>(image.dimension), image.mip_count, exemplar,
+				    format(exemplar), static_cast<uint32_t>(image_class.numeric_class),
+				    static_cast<uint32_t>(image_class.dimension), image_class.mip_count));
 			}
 		}
 	}

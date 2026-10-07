@@ -854,6 +854,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
 			return;
 		}
+		if (dref && std::ranges::any_of(image.indirect_resources, [&](uint32_t resource) {
+			    return state.program.info.images[resource].conversion_format !=
+			           Prospero::BufferFormat::kInvalid;
+		    })) {
+			ctx.Fail(inst, "uses depth comparison with a converted indirect image");
+			return;
+		}
 		const auto selected = EmitIndirectResourceIndex(
 		    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
 		struct SampleRun {
@@ -873,6 +880,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto& first = state.program.info.images[run.resource];
 				const auto next_slot = run.slot_bias + ordinal;
 				if (candidate.dimension == first.dimension && candidate.cube == first.cube &&
+				    candidate.conversion_format == first.conversion_format &&
+				    candidate.shader_swizzle == first.shader_swizzle &&
 				    IR::DescriptorBindingForImage(first) == kind &&
 				    candidate.mip_count == 1u && first.mip_count == 1u &&
 				    (ordinal == 1u || (next_slot < binding.resources.size() &&
@@ -915,13 +924,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                          ConstantU32(state, index), run_index);
 			run_index = next;
 		}
-		auto result = runs.size() == 1u
-		                  ? EmitRun(0u)
-		                  : EmitIndexSwitch(state, run_index, static_cast<uint32_t>(runs.size()),
-		                                    result_type, EmitRun);
-		if (!dref) {
-			result = UnpackImageTexel(ctx, mem, result);
-		}
+		// Candidates may differ in conversion format and swizzle, so each run unpacks its own
+		// texels; materialization guarantees they share the unpacked result type.
+		const auto EmitUnpackedRun = [&](uint32_t index) {
+			const auto sample = EmitRun(index);
+			if (dref) return sample;
+			auto run_mem     = mem;
+			run_mem.resource = runs[index].resource;
+			return UnpackImageTexel(ctx, run_mem, sample);
+		};
+		const auto result = runs.size() == 1u
+		                        ? EmitUnpackedRun(0u)
+		                        : EmitIndexSwitch(state, run_index,
+		                                          static_cast<uint32_t>(runs.size()), result_type,
+		                                          EmitUnpackedRun);
 		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 		return;
 	}
