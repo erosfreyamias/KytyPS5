@@ -162,10 +162,12 @@ private:
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
-	// True when a new image of this many bytes would push device memory past the critical level.
+	// True when a new image of this many bytes would push live device memory past the critical
+	// level, or total device memory past the budget.
 	[[nodiscard]] bool NeedsMemoryReclaim(uint64_t bytes) const;
-	// Frees images no draw used this frame, copying GPU-written contents back to guest memory
-	// first, and waits for the GPU so their memory is released. Caller must not hold m_lock.
+	// Frees images no draw used in the last two submissions, copying GPU-written contents back
+	// to guest memory first, and waits for the GPU so their memory is released. Caller must
+	// not hold m_lock.
 	void ReclaimMemory(uint64_t bytes);
 
 	GraphicContext&                                   m_graphics;
@@ -186,6 +188,7 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	uint64_t         m_reclaim_tick           = UINT64_MAX;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 

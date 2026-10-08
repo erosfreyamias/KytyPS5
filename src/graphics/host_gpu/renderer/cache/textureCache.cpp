@@ -2017,28 +2017,48 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::NeedsMemoryReclaim(uint64_t bytes) const {
-	return m_graphics.CanReportMemoryUsage() && m_critical_gc_memory != 0 &&
-	       m_graphics.GetDeviceMemoryUsage() + bytes >= m_critical_gc_memory;
+	if (!m_graphics.CanReportMemoryUsage() || m_critical_gc_memory == 0) {
+		return false;
+	}
+	// Free space inside allocated blocks takes new images without growing device memory.
+	if (m_graphics.GetDeviceMemoryLiveUsage() + bytes >= m_critical_gc_memory) {
+		return true;
+	}
+	// Fragmented blocks can still grow device memory to the budget; reclaim once per
+	// submission for that, so freeing that does not empty blocks is not repeated per image.
+	return m_reclaim_tick != m_gc_tick &&
+	       m_graphics.GetDeviceMemoryUsage() + bytes >= m_graphics.GetTotalMemoryBudget();
 }
 
 void TextureCache::ReclaimMemory(uint64_t bytes) {
-	uint64_t freed  = 0;
-	uint32_t images = 0;
-	uint64_t usage  = 0;
-	size_t   cached = 0;
+	constexpr uint64_t GiB    = 1024ull * 1024 * 1024;
+	uint64_t           freed  = 0;
+	uint32_t           images = 0;
+	uint64_t           live   = 0;
+	uint64_t           usage  = 0;
+	size_t             cached = 0;
 	{
 		std::scoped_lock lock {m_lock};
-		usage = m_graphics.GetDeviceMemoryUsage();
+		m_reclaim_tick    = m_gc_tick;
+		live              = m_graphics.GetDeviceMemoryLiveUsage();
+		usage             = m_graphics.GetDeviceMemoryUsage();
+		const auto budget = m_graphics.GetTotalMemoryBudget();
 		// Free down to the pressure level so one reclaim covers many new images.
-		const auto target = usage + bytes > m_pressure_gc_memory
-		                        ? usage + bytes - m_pressure_gc_memory
-		                        : uint64_t {0};
+		auto target = live + bytes > m_pressure_gc_memory ? live + bytes - m_pressure_gc_memory
+		                                                  : uint64_t {0};
+		if (usage + bytes >= budget) {
+			// Free enough old images that whole blocks can empty.
+			target = std::max(target, usage + bytes - budget + GiB);
+		}
 		std::vector<ImageId> candidates;
-		// Oldest first; images any draw touched this frame are left alone.
-		m_lru_cache.ForEachItemBelow(m_gc_tick, [&](ImageId id) {
-			candidates.push_back(id);
-			return false;
-		});
+		// Oldest first. LRU ticks advance once per guest submission, and images used by the
+		// current or previous submission stay: the current draw may hold their IDs.
+		if (m_gc_tick >= 2) {
+			m_lru_cache.ForEachItemBelow(m_gc_tick - 2, [&](ImageId id) {
+				candidates.push_back(id);
+				return false;
+			});
+		}
 		for (const auto id: candidates) {
 			if (freed >= target) {
 				break;
@@ -2057,18 +2077,22 @@ void TextureCache::ReclaimMemory(uint64_t bytes) {
 		}
 		m_slot_images.ForEach([&](ImageId, const Image&) { ++cached; });
 	}
-	static uint32_t reports = 0;
-	if (reports < 16) {
-		++reports;
-		std::printf("Texture cache: VRAM %" PRIu64 " MiB of %" PRIu64 " MiB in use; freed %" PRIu64
-		            " MiB from %u unused images (%zu cached)\n",
-		            usage >> 20u, m_critical_gc_memory >> 20u, freed >> 20u, images, cached);
-		std::fflush(stdout);
-	}
 	if (images != 0) {
 		// Deleted images and their downloads complete once the GPU finishes this submission.
 		m_scheduler.Wait(m_scheduler.CurrentTick());
 		m_scheduler.PopPendingOperations();
+	}
+	static uint32_t reports = 0;
+	if (reports < 16) {
+		++reports;
+		std::printf("Texture cache: VRAM %" PRIu64 " MiB in use (%" PRIu64
+		            " MiB live, critical %" PRIu64 " MiB); freed %" PRIu64
+		            " MiB from %u unused images (%zu cached), now %" PRIu64 " MiB in use (%" PRIu64
+		            " MiB live)\n",
+		            usage >> 20u, live >> 20u, m_critical_gc_memory >> 20u, freed >> 20u, images,
+		            cached, m_graphics.GetDeviceMemoryUsage() >> 20u,
+		            m_graphics.GetDeviceMemoryLiveUsage() >> 20u);
+		std::fflush(stdout);
 	}
 }
 
