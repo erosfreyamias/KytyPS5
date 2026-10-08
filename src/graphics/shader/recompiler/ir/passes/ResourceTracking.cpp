@@ -6,6 +6,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <array>
+#include <cinttypes>
+#include <cstdio>
 #include <fmt/format.h>
 #include <map>
 #include <optional>
@@ -18,6 +21,9 @@ namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
+// Wrap addressing; LOD 0..15.99; bilinear XY and Z filters with linear mips; no border color.
+constexpr std::array<uint32_t, 4> DefaultSamplerWords {
+    0u, 0xfffu << 12u, (1u << 20u) | (1u << 22u) | (1u << 24u) | (2u << 26u), 0u};
 
 uint32_t PossibleU32Bits(Value value) {
 	value = value.Resolve();
@@ -2098,8 +2104,27 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			if (!sampler || bad_dword != 0u) {
+				Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
+				                     ValueOpcodeName(expected), bad_dword));
+			}
+			// The whole S# comes from data only the GPU knows: its addressing and filter word
+			// is not a host value (PPSA03671 selects material samplers that way). Specialize
+			// on a default sampler instead of aborting: wrap addressing, bilinear filtering
+			// with linear mips over the full LOD range. Explicit-LOD gathers still read the
+			// real S# words on the GPU.
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				std::printf("Warning: shader 0x%016" PRIx64 " pc=0x%08x selects its sampler at "
+				            "runtime; using a default linear wrap sampler.\n",
+				            m_program.shader_hash, pc);
+			}
+			descriptor = {};
+			descriptor.dword_count = 4u;
+			descriptor.dwords      = {Value(DefaultSamplerWords[0]), Value(DefaultSamplerWords[1]),
+			                          Value(DefaultSamplerWords[2]), Value(DefaultSamplerWords[3]),
+			                          Value(0u), Value(0u), Value(0u), Value(0u)};
 		}
 		source = InternSource(descriptor);
 		return true;

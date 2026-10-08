@@ -486,6 +486,37 @@ void TestIndirectGatherMixedMipCounts() {
   Check(slots == 9u, "mixed mip table candidates did not get one descriptor slot per level");
 }
 
+// PPSA03671 selects some material samplers from data only the GPU knows. Tracking falls back to a
+// default sampler (wrap, bilinear, linear mips) instead of aborting.
+void TestRuntimeSelectedSamplerUsesDefault() {
+  Fixture fixture;
+  std::array<Value, 8> image_words;
+  for (uint32_t i = 0; i < image_words.size(); i++) image_words[i] = fixture.UserData(i);
+  const auto lane = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto sampler = fixture.Sampler(
+      {lane, fixture.UserData(9), fixture.UserData(10), fixture.UserData(11)}, 0x2c8);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {fixture.Image(image_words, 0x2c8), sampler, fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x2c8));
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.samplers.size() == 1u,
+        "a runtime-selected sampler was not tracked");
+  const auto &source =
+      fixture.program.descriptor_sources[fixture.program.info.samplers[0].source];
+  constexpr std::array<uint32_t, 4> expected{0u, 0xfffu << 12u, 0x09500000u, 0u};
+  bool matches = source.dword_count == 4u;
+  for (uint32_t i = 0; matches && i < 4u; ++i) {
+    const auto word = source.dwords[i].Resolve();
+    matches = word.IsImmediate() && word.U32() == expected[i];
+  }
+  Check(matches, "a runtime-selected sampler did not use the default sampler words");
+}
+
 void TestBoundedImageViewEligibility() {
   using Type = Libs::Graphics::Prospero::ImageType;
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
@@ -2672,6 +2703,10 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
                                {result, Value(0u)})});
   }
   fixture.PlanAndTrack();
+  if (nonuniform || writable) {
+    // The host cannot select this sampler; tracking specializes on the default sampler.
+    return ExtractResourcePlan(fixture.program);
+  }
   Check(std::ranges::count_if(fixture.program.value_storage, [](const Inst &inst) {
           return inst.GetOpcode() == ValueOpcode::SelectU32;
         }) == 4,
@@ -2727,13 +2762,21 @@ void TestConditionalSamplerPhi() {
         }
       }
     }
-    CheckFatal([&] { ConditionalSamplerPlan(diamond, false, false, true); },
-               "not a valid runtime value",
-               "nonuniform sampler selection was accepted");
-    CheckFatal(
-        [&] { ConditionalSamplerPlan(diamond, false, false, false, true); },
-        "not a valid runtime value",
-        "shader-written sampler predicate was accepted");
+    // A sampler the host cannot select specializes on the default sampler instead.
+    const auto CheckDefaultSampler = [](const ResourcePlan &plan, const char *message) {
+      constexpr std::array<uint32_t, 4> expected{0u, 0xfffu << 12u, 0x09500000u, 0u};
+      bool matches = plan.info.samplers.size() == 1u;
+      const auto &source = plan.descriptor_sources[plan.info.samplers[0].source];
+      for (uint32_t i = 0; matches && i < 4u; ++i) {
+        const auto word = source.dwords[i].Resolve();
+        matches = word.IsImmediate() && word.U32() == expected[i];
+      }
+      Check(matches, message);
+    };
+    CheckDefaultSampler(ConditionalSamplerPlan(diamond, false, false, true),
+                        "nonuniform sampler selection did not use the default sampler");
+    CheckDefaultSampler(ConditionalSamplerPlan(diamond, false, false, false, true),
+                        "shader-written sampler predicate did not use the default sampler");
   }
 }
 
@@ -3781,6 +3824,7 @@ int main() {
     Run("null scalar pointer descriptor", TestNullScalarPointerDescriptor);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("indirect gather mixed mip counts", TestIndirectGatherMixedMipCounts);
+    Run("runtime-selected sampler uses default", TestRuntimeSelectedSamplerUsesDefault);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
