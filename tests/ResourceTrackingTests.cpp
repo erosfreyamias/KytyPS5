@@ -576,6 +576,103 @@ void TestUserDataSelectedWrittenBuffer() {
   }
 }
 
+// The same shader reads both candidate addresses from its SRT on either arm of the branch and
+// sets the swizzle bit (S_BITSET1 s9, 18) after the merge, so the high dword is an OR of the Phi.
+void TestUserDataSelectedWrittenBufferSwizzleBit() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *first_arm = fixture.AddBlock();
+  auto *second_arm = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  entry->AddBranch(first_arm);
+  entry->AddBranch(second_arm);
+  first_arm->AddBranch(merge);
+  second_arm->AddBranch(merge);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1u, .false_block = 2u};
+  fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                              .true_block = 3u};
+  fixture.program.block_info[2].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                              .true_block = 3u};
+  fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(2), Value(0u)});
+  const auto srt_low = fixture.UserData(4);
+  const auto srt_high = fixture.UserData(5);
+  const auto read = [&](Block *block, uint32_t offset, uint32_t pc) {
+    const auto handle =
+        fixture.Emit(ValueOpcode::GetAddressResource, {srt_low, srt_high}, 0, block);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = offset;
+    return fixture.Emit(ValueOpcode::LoadAddressU32,
+                        {handle, Value(0u), Value(0u), Value(true)},
+                        fixture.AddMemory(memory, pc), block);
+  };
+  const auto first_low = fixture.Emit(
+      ValueOpcode::IAdd32, {fixture.UserData(3), read(first_arm, 156u, 0x0c)}, 0, first_arm);
+  const auto first_high = fixture.Emit(ValueOpcode::GetUserData,
+                                       {Value(static_cast<ScalarReg>(0))}, 0, first_arm);
+  const auto second_low = fixture.Emit(
+      ValueOpcode::IAdd32, {read(second_arm, 64u, 0x40), fixture.UserData(6)}, 0, second_arm);
+  const auto second_high = read(second_arm, 68u, 0x40);
+  const auto phi = [&](Value first, Value second) {
+    auto &inst = merge->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    inst.AddPhiOperand(first_arm, first);
+    inst.AddPhiOperand(second_arm, second);
+    return Value(&inst);
+  };
+  const auto low = phi(first_low, second_low);
+  const auto high = phi(first_high, second_high);
+  fixture.block = merge;
+  const auto swizzled = fixture.Emit(ValueOpcode::BitwiseOr32, {high, Value(0x00040000u)});
+  const auto records =
+      fixture.Emit(ValueOpcode::IAdd32, {read(merge, 132u, 0x64), Value(4u)});
+  const auto buffer =
+      fixture.Buffer({low, swizzled, records, Value(0x00016204u)}, 0x84);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {buffer, Value(0u), Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 0x84));
+  fixture.PlanAndTrack();
+  const auto &info = fixture.program.info;
+  Check(info.buffers.size() == 1u && info.buffers[0].written,
+        "a written buffer with a swizzled selected address was not tracked");
+  const auto &source = fixture.program.descriptor_sources[info.buffers[0].source];
+  const auto *base = source.dwords[0].ResolveInstruction();
+  const auto *swizzle = source.dwords[1].ResolveInstruction();
+  const auto *swizzle_select =
+      swizzle == nullptr ? nullptr : swizzle->Arg(0).ResolveInstruction();
+  Check(base != nullptr && base->GetOpcode() == ValueOpcode::SelectU32 &&
+            swizzle != nullptr && swizzle->GetOpcode() == ValueOpcode::BitwiseOr32 &&
+            swizzle_select != nullptr && swizzle_select->GetOpcode() == ValueOpcode::SelectU32,
+        "a swizzled selected buffer address was not rebuilt on the host selection");
+
+  const auto plan = ExtractResourcePlan(fixture.program);
+  LinearTestMemory memory_words;
+  memory_words.words[156u / 4u] = 0x300u;
+  memory_words.words[64u / 4u] = 0x5000u;
+  memory_words.words[68u / 4u] = 0x7u;
+  memory_words.words[132u / 4u] = 60u;
+  for (const bool flag : {true, false}) {
+    const std::array<uint32_t, 7> user_data{0x9u, 0u, flag ? 1u : 0u, 0x40u,
+                                            0x1000u, 0u, 0x20u};
+    SrtRuntime runtime{.user_data = user_data, .userdata = &memory_words,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const std::array<uint32_t, 4> expected{flag ? 0x340u : 0x5020u,
+                                           (flag ? 0x9u : 0x7u) | 0x00040000u, 64u,
+                                           0x00016204u};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers.size() == 1u &&
+              std::equal(expected.begin(), expected.end(), snapshot.buffers[0].dwords.begin()),
+          "a swizzled selected buffer address did not follow the user-data flag");
+  }
+}
+
 void TestBoundedImageViewEligibility() {
   using Type = Libs::Graphics::Prospero::ImageType;
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
@@ -3885,6 +3982,8 @@ int main() {
     Run("indirect gather mixed mip counts", TestIndirectGatherMixedMipCounts);
     Run("runtime-selected sampler uses default", TestRuntimeSelectedSamplerUsesDefault);
     Run("user-data-selected written buffer", TestUserDataSelectedWrittenBuffer);
+    Run("user-data-selected written buffer with swizzle bit",
+        TestUserDataSelectedWrittenBufferSwizzleBit);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

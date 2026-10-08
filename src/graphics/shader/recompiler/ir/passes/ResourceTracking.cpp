@@ -712,6 +712,38 @@ private:
 		return Value(&selected);
 	}
 
+	// Lowers descriptor Phis under pure arithmetic and rebuilds that arithmetic on the host
+	// selection. PPSA03671 CS b8b17176ff277f18 sets the swizzle bit (S_BITSET1 s9, 18) after
+	// picking a buffer address on either arm of a branch.
+	Value LowerDescriptorValue(Value value, uint32_t depth = 0) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return value;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::Phi) return LowerDescriptorPhi(value);
+		if (depth >= 8u || NumArgsOf(op) != inst->NumArgs() || inst->MayHaveSideEffects() ||
+		    op == ValueOpcode::ReadConst || op == ValueOpcode::GetSrtResource ||
+		    BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+			return value;
+		}
+		for (const auto& [original, selected]: m_descriptor_selections) {
+			if (original == inst) return selected;
+		}
+		std::vector<Value> args(inst->NumArgs());
+		bool               changed = false;
+		for (size_t index = 0; index < args.size(); ++index) {
+			args[index] = LowerDescriptorValue(inst->Arg(index), depth + 1u);
+			changed     = changed || !(args[index] == inst->Arg(index).Resolve());
+		}
+		if (!changed) return value;
+		auto& lowered = m_program.value_storage.emplace_back(op, inst->Flags<uint64_t>());
+		for (size_t index = 0; index < args.size(); ++index) lowered.SetArg(index, args[index]);
+		m_descriptor_selections.emplace_back(inst, Value(&lowered));
+		return Value(&lowered);
+	}
+
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
 	                uint32_t base_reg, DescriptorSource& descriptor, uint32_t pc) {
 		const auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
@@ -729,7 +761,7 @@ private:
 		for (uint32_t i = 0; i < width; i++) {
 			const auto value = base_reg != UINT32_MAX
 			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
-			descriptor.dwords[i] = LowerDescriptorPhi(value);
+			descriptor.dwords[i] = LowerDescriptorValue(value);
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
