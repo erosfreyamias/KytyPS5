@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -308,6 +309,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
+		const PerfStats::Scope timing(PerfStats::Stage::Readback);
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}

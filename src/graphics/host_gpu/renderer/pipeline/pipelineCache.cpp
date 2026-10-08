@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -383,18 +384,24 @@ struct PipelineCache::ProgramCache {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			{
+				const PerfStats::Scope timing(PerfStats::Stage::ResourceWalk);
+				EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+				    entry->second.resource_plan, runtime, entry->second.resources,
+				    entry->second.specialization));
+			}
+			const auto permutation = [&] {
+				const PerfStats::Scope timing(PerfStats::Stage::VariantLookup);
+				return std::ranges::find_if(
+				    entry->second.permutations, [&](const Permutation& candidate) {
+					    const auto& layout = candidate.program.bindings;
+					    return layout.push_data_start_dword ==
+					               ShaderRecompiler::IR::PushData::StartFor(
+					                   push_data_cursor, layout.ShaderDataDwords()) &&
+					           candidate.specialization == entry->second.specialization;
+				    });
+			}();
+			if (permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);

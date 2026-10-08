@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/perfStats.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -775,6 +776,7 @@ void RenderExecutor::ResetBindings() {
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	const PerfStats::Scope perf_timing(PerfStats::Stage::Bindings);
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
@@ -835,6 +837,7 @@ static void WarnUnmappedBuffer(const char* kind, uint64_t address, uint64_t size
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
+	const PerfStats::Scope perf_timing(PerfStats::Stage::Buffers);
 	auto& cache = m_context.GetBufferCache();
 	for (auto* stage: stages) {
 		auto& prepared = *stage;
@@ -891,6 +894,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	const PerfStats::Scope perf_timing(PerfStats::Stage::Buffers);
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = *prepared.runtime->resources;
@@ -927,6 +931,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	const PerfStats::Scope perf_timing(PerfStats::Stage::Images);
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
@@ -1011,6 +1016,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	const PerfStats::Scope perf_timing(PerfStats::Stage::Bindings);
 	auto   vk_buffer        = buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
