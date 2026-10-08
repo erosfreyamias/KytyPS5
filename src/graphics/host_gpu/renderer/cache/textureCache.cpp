@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -1854,14 +1855,25 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!transfer.valid || !image.SafeToDownload()) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	const auto range  = image.info.data;
+	auto&      stream = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	    stream.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	// An image larger than the reusable buffer downloads through a buffer of its own, which
+	// lives until its contents reach guest memory.
+	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     AllFlags, range.size);
+		mapped    = temporary->Mapped().data();
+		offset    = 0;
+		if (mapped == nullptr) {
+			return false;
+		}
+	} else {
+		stream.Commit();
 	}
-	download.Commit();
+	Buffer& download = temporary ? *temporary : static_cast<Buffer&>(stream);
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
@@ -1881,10 +1893,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	m_scheduler.DeferPriorityOperation(
+	    [&stream, owner = std::move(temporary), range, mapped, offset] {
+		    (owner ? *owner : static_cast<Buffer&>(stream)).Invalidate(offset, range.size);
+		    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+	    });
 	return true;
 }
 
