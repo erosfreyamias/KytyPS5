@@ -81,6 +81,15 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+bool RenderContext::InvalidateOverwrittenMemory(uint64_t vaddr, uint64_t size) {
+	if (!IsMapped(vaddr, size)) {
+		return false;
+	}
+	m_buffer_cache.InvalidateOverwrittenMemory(vaddr, size);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;

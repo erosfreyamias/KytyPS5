@@ -18,6 +18,7 @@ enum class Stage : uint32_t { ResourceWalk, VariantLookup, Buffers, Images, Bind
 enum class Readback : uint32_t {
 	CpuRead,
 	CpuWrite,
+	FileRead,
 	ShaderSetup,
 	ColorClear,
 	IndirectArgs,
@@ -32,6 +33,7 @@ struct State {
 	std::atomic<uint64_t>                                                draws {0};
 	std::atomic<uint64_t>                                                dispatches {0};
 	std::atomic<uint64_t>                                                images {0};
+	std::atomic<uint64_t>                                                reused_images {0};
 	std::atomic<int64_t>                                                 window_start {0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Readback::Count)> readbacks {};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(Readback::Count)> readback_ns {};
@@ -95,6 +97,11 @@ inline void CountImages(size_t count) {
 	Get().images.fetch_add(count, std::memory_order_relaxed);
 }
 
+// Counts the bound images a stage reused from an earlier draw without looking them up.
+inline void CountReusedImages(size_t count) {
+	Get().reused_images.fetch_add(count, std::memory_order_relaxed);
+}
+
 // Counts one draw or dispatch; every five seconds prints the per-second time of each stage.
 inline void CountWork(bool dispatch) {
 	auto& state = Get();
@@ -117,21 +124,22 @@ inline void CountWork(bool dispatch) {
 	const auto draws      = static_cast<double>(state.draws.exchange(0)) / seconds;
 	const auto dispatches = static_cast<double>(state.dispatches.exchange(0)) / seconds;
 	const auto images     = static_cast<double>(state.images.exchange(0)) / seconds;
+	const auto reused     = static_cast<double>(state.reused_images.exchange(0)) / seconds;
 	std::array<double, static_cast<size_t>(Readback::Count)> count {};
 	std::array<double, static_cast<size_t>(Readback::Count)> wait {};
 	for (size_t source = 0; source < count.size(); ++source) {
 		count[source] = static_cast<double>(state.readbacks[source].exchange(0)) / seconds;
 		wait[source]  = static_cast<double>(state.readback_ns[source].exchange(0)) / 1e6 / seconds;
 	}
-	std::printf("Perf per second: %.0f draws, %.0f dispatches, %.0f image bindings | resource walk "
-	            "%.0f ms | variant lookup %.0f ms | buffers %.0f ms | images %.0f ms | bindings "
-	            "%.0f ms | readback waits %.0f ms\n",
-	            draws, dispatches, images, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5]);
+	std::printf("Perf per second: %.0f draws, %.0f dispatches, %.0f image bindings (%.0f reused) | "
+	            "resource walk %.0f ms | variant lookup %.0f ms | buffers %.0f ms | images %.0f ms "
+	            "| bindings %.0f ms | readback waits %.0f ms\n",
+	            draws, dispatches, images, reused, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5]);
 	std::printf("Perf per second (readbacks): cpu read %.0f (%.0f ms) | cpu write %.0f (%.0f ms) | "
-	            "shader setup %.0f (%.0f ms) | color clear %.0f (%.0f ms) | indirect args %.0f "
-	            "(%.0f ms) | other %.0f (%.0f ms)\n",
+	            "file read %.0f (%.0f ms) | shader setup %.0f (%.0f ms) | color clear %.0f (%.0f "
+	            "ms) | indirect args %.0f (%.0f ms) | other %.0f (%.0f ms)\n",
 	            count[0], wait[0], count[1], wait[1], count[2], wait[2], count[3], wait[3],
-	            count[4], wait[4], count[5], wait[5]);
+	            count[4], wait[4], count[5], wait[5], count[6], wait[6]);
 	std::fflush(stdout);
 }
 

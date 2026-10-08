@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -70,6 +71,31 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+
+	// The sampled textures in `images` stay acquired after a draw. A later draw of the same
+	// program reuses each one whose descriptor and image are unchanged.
+	struct TextureReuse {
+		struct Stage {
+			std::vector<TextureBinding>                        images;
+			std::vector<ShaderRecompiler::IR::DescriptorValue> descriptors;
+			std::vector<ImageId>                               ids;
+			std::vector<uint64_t>                              layout_versions;
+		};
+
+		// The program `images` belongs to (CompiledShaderInfo::serial). Per binding: its
+		// descriptor, and its image with that image's layout version when acquired; the ID is
+		// invalid for one that cannot be reused.
+		uint64_t                                           program = 0;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> descriptors;
+		std::vector<ImageId>                               ids;
+		std::vector<uint64_t>                              layout_versions;
+		// Set once every view in `images` is acquired; cleared while they are re-resolved.
+		bool valid = false;
+		// Per binding, whether this draw reuses it.
+		std::vector<uint8_t> reused;
+		// The textures of other programs these bindings drew recently, by program.
+		std::unordered_map<uint64_t, Stage> stages;
+	} texture_reuse;
 };
 
 [[nodiscard]] vk::DescriptorType

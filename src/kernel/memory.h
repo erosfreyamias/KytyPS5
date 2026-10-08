@@ -121,6 +121,7 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // an unmapped page reads zero, so callers bind a null resource.
 [[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// Prepares GPU-cached memory for a CPU write that overwrites all of [vaddr, vaddr + size).
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;

@@ -850,11 +850,56 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
+	auto& texture_cache = m_context.GetTextureCache();
+	auto& reuse         = prepared.texture_reuse;
+	if (reuse.program != program.serial) {
+		// Keep the previous program's textures for its next draw, and take this program's.
+		// Small tables are cheaper to look up again than to keep.
+		constexpr size_t MaxStages      = 16;
+		constexpr size_t MinStageImages = 16;
+		if (reuse.valid && reuse.ids.size() >= MinStageImages) {
+			if (reuse.stages.size() >= MaxStages && !reuse.stages.contains(reuse.program)) {
+				reuse.stages.erase(reuse.stages.begin());
+			}
+			auto& previous = reuse.stages[reuse.program];
+			previous.images.swap(prepared.images);
+			previous.descriptors.swap(reuse.descriptors);
+			previous.ids.swap(reuse.ids);
+			previous.layout_versions.swap(reuse.layout_versions);
+		}
+		reuse.valid = false;
+		if (const auto found = reuse.stages.find(program.serial); found != reuse.stages.end()) {
+			prepared.images.swap(found->second.images);
+			reuse.descriptors.swap(found->second.descriptors);
+			reuse.ids.swap(found->second.ids);
+			reuse.layout_versions.swap(found->second.layout_versions);
+			reuse.stages.erase(found);
+			reuse.program = program.serial;
+			reuse.valid   = true;
+		}
+	}
+	// Same program and descriptor, and no image changed that a lookup could pick instead:
+	// FindImage would return the same sampled image again.
+	const auto image_count = program.info.images.size();
+	reuse.reused.assign(image_count, 0);
+	if (reuse.valid && program.serial != 0 && reuse.program == program.serial &&
+	    prepared.images.size() == image_count && reuse.descriptors.size() == image_count) {
+		for (size_t i = 0; i < image_count; i++) {
+			reuse.reused[i] = !program.info.images[i].written &&
+			                  reuse.descriptors[i] == snapshot.images[i];
+		}
+		(void)texture_cache.ReacquireTextures(reuse.ids, reuse.layout_versions, reuse.reused);
+	}
+	reuse.valid = false;
 	prepared.images.resize(program.info.images.size());
 	PerfStats::CountImages(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (reuse.reused[i] != 0) {
+			BindImage(prepared.images[i].image_id, false);
+			continue;
+		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		binding.mip_views.swap(prepared.images[i].mip_views);
@@ -1004,22 +1049,42 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	auto& reuse         = prepared.texture_reuse;
+	// Reused textures keep their views unless something changed them since PrepareBindings.
+	size_t reacquired = 0;
+	if (reuse.reused.size() == images.size()) {
+		m_reacquired.assign(reuse.reused.begin(), reuse.reused.end());
+		reacquired =
+		    texture_cache.ReacquireTextures(reuse.ids, reuse.layout_versions, m_reacquired);
+	} else {
+		m_reacquired.assign(images.size(), 0);
+	}
+	m_texture_ids.resize(images.size());
+	m_texture_layout_versions.resize(images.size());
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
+		const auto& resource  = program.info.images[i];
+		bool        reused    = m_reacquired[i] != 0;
+		// PrepareBindings skipped the lookup for a texture that has changed since.
+		const bool  stale     = !reused && i < reuse.reused.size() && reuse.reused[i] != 0;
+		const auto  old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
+		const bool  replaced  = old_image == nullptr ||
+		                       (!old_image->registered && !old_image->info.data.Empty()) ||
+		                       old_image->binding.needs_rebind;
+		if (replaced || stale) {
+			if (replaced && old_image != nullptr) {
 				old_image->binding = {};
 			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
+			reused = false;
 		}
 		auto& binding = images[i];
-		binding.mip_views.clear();
-		const auto& resource = program.info.images[i];
-		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+		if (reused) {
+			// Acquired by an earlier draw, and still current.
+		} else if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+			binding.mip_views.clear();
 			EXIT_IF(resource.mip_count == 0u ||
 			        resource.mip_count != binding.desc.view_info.level_count);
 			binding.mip_views.reserve(resource.mip_count);
@@ -1033,13 +1098,28 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			binding.image_view = binding.mip_views.front();
 		} else {
+			binding.mip_views.clear();
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+		// A reused texture keeps the version it was checked against, so a change during this
+		// loop is seen by the next draw.
+		const auto kind = binding.desc.info.metadata.kind;
+		const bool reusable =
+		    !storage && kind != ImageMetadataKind::Dcc && kind != ImageMetadataKind::Cmask;
+		m_texture_ids[i] = reusable ? binding.image_id : ImageId {};
+		m_texture_layout_versions[i] = reused ? reuse.layout_versions[i] : image.layout_version;
 	}
+	// Every view is acquired; the next draw of this program may reuse them.
+	reuse.program = program.serial;
+	reuse.ids.swap(m_texture_ids);
+	reuse.layout_versions.swap(m_texture_layout_versions);
+	reuse.descriptors = snapshot.images;
+	reuse.valid       = program.serial != 0;
+	PerfStats::CountReusedImages(reacquired);
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,

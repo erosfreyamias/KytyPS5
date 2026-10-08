@@ -930,7 +930,7 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
-	(void)GetGpuResources().InvalidateMemory(vaddr, size);
+	(void)GetGpuResources().InvalidateOverwrittenMemory(vaddr, size);
 }
 
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {

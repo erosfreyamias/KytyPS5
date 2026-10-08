@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -56,6 +57,12 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// For textures a draw binds again as an earlier draw acquired them. Keeps the flag of each
+	// one that does not need the full lookup, that is, it still has the layout version it had
+	// then, is current with guest memory and still tracked, and has no stencil or color
+	// metadata, and touches those. Clears the other flags; returns how many stay set.
+	size_t ReacquireTextures(std::span<const ImageId>  ids,
+	                         std::span<const uint64_t> layout_versions, std::span<uint8_t> reusable);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -113,6 +120,7 @@ private:
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
 	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
+	void                      BumpLayoutVersions(const Image& changed);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
 	void                      FreeImage(ImageId id);

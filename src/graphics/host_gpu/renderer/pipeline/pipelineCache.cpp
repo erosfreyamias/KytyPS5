@@ -351,11 +351,13 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
-		return {
+		Permutation permutation {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id = ++next_shader_id, .module = module},
 		};
+		permutation.program.serial = permutation.handle.id;
+		return permutation;
 	}
 
 	template <typename InputInfo>

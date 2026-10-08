@@ -162,23 +162,36 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       GuestRange skip) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
+	bool                        gpu_written    = false;
 	const auto                  buffer_address = buffer.CpuAddress();
+	const auto copy = [&](uint64_t start, uint64_t end) {
+		if (start < end) {
+			copies.emplace_back(start - buffer_address, total_size, end - start);
+			// Keep packed ranges on separate cache lines, as in shadPS4.
+			total_size += Common::AlignUp(end - start, 64);
+		}
+	};
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
-			    // Keep packed ranges on separate cache lines, as in shadPS4.
-			    total_size += Common::AlignUp(end - start, 64);
+			    gpu_written = true;
+			    if (skip.size == 0 || end <= skip.address || start >= skip.End()) {
+				    copy(start, end);
+			    } else {
+				    copy(start, skip.address);
+				    copy(skip.End(), end);
+			    }
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
-		return false;
+		return gpu_written;
 	}
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
@@ -297,22 +310,33 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::InvalidateOverwrittenMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid memory-invalidation range\n");
+	}
+	m_memory_tracker.InvalidateRegion(vaddr, size,
+	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true, true); });
+}
+
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool overwritten) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	const auto source =
-	    is_write ? PerfStats::Readback::CpuWrite : PerfStats::t_readback_source;
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, source] {
+	const auto source = overwritten ? PerfStats::Readback::FileRead
+	                    : is_write  ? PerfStats::Readback::CpuWrite
+	                                : PerfStats::t_readback_source;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, overwritten,
+	                                                source] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		const auto start      = PerfStats::NowNanoseconds();
-		const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
+		const bool downloaded = DownloadBufferMemory<false>(
+		    buffer, vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {});
 		PerfStats::CountReadback(source, downloaded, PerfStats::NowNanoseconds() - start);
 		if (downloaded) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);

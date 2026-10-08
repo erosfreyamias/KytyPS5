@@ -51,7 +51,11 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// Like InvalidateMemory for a range the CPU is about to overwrite completely, such as a file
+	// read: GPU-written bytes inside it are not copied back, only those sharing its pages.
+	void                   InvalidateOverwrittenMemory(uint64_t vaddr, uint64_t size);
+	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                                  bool overwritten = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
@@ -118,8 +122,11 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
+	// Returns whether the range held GPU-written bytes. Those inside `skip` are dropped
+	// without a copy.
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        GuestRange skip = {});
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

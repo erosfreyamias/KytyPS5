@@ -245,6 +245,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	BumpLayoutVersions(image);
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
@@ -269,6 +270,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	BumpLayoutVersions(image);
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -276,6 +278,20 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+}
+
+void TextureCache::BumpLayoutVersions(const Image& changed) {
+	ForEachPage(changed.info.data.address, changed.info.data.size, [this](uint64_t page) {
+		const auto* owners = m_image_page_table.Find(page);
+		if (owners == nullptr) {
+			return;
+		}
+		owners->ForEach([this](ImageId owner) {
+			if (auto* image = m_slot_images.try_get(owner); image != nullptr) {
+				++image->layout_version;
+			}
+		});
+	});
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1144,7 +1160,10 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto range = desc.info.metadata.range;
 	{
 		std::scoped_lock lock {m_lock};
-		auto& image         = m_slot_images[id];
+		auto& image = m_slot_images[id];
+		if (!(image.info.metadata == desc.info.metadata)) {
+			++image.layout_version;
+		}
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
@@ -1261,6 +1280,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
+	if (record.depth_id != depth_id) {
+		++record.layout_version;
+	}
 	record.depth_id             = depth_id;
 	record.stencil_subresources = depth.stencil_subresources;
 	return association;
@@ -1445,6 +1467,46 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	return image.FindView(desc.view_info);
 }
 
+size_t TextureCache::ReacquireTextures(std::span<const ImageId>  ids,
+                                       std::span<const uint64_t> layout_versions,
+                                       std::span<uint8_t>        reusable) {
+	std::scoped_lock lock {m_lock};
+	if (ids.size() != layout_versions.size() || ids.size() != reusable.size()) {
+		std::fill(reusable.begin(), reusable.end(), uint8_t {0});
+		return 0;
+	}
+	const auto tick  = m_scheduler.CurrentTick();
+	size_t     count = 0;
+	for (size_t i = 0; i < ids.size(); i++) {
+		if (reusable[i] == 0) {
+			continue;
+		}
+		auto* image = m_slot_images.try_get(ids[i]);
+		if (image == nullptr) {
+			reusable[i] = 0;
+			continue;
+		}
+		if (!image->info.data.Empty()) {
+			const auto kind = image->info.metadata.kind;
+			// These are the cases where FindImage or FindTexture would pick another image or
+			// upload to this one; anything else they would leave as it is.
+			if (image->layout_version != layout_versions[i] || !image->registered ||
+			    image->depth_id || image->binding.needs_rebind || image->info.HasStencil() ||
+			    kind == ImageMetadataKind::Dcc || kind == ImageMetadataKind::Cmask ||
+			    image->IsCpuDirty() || image->IsBufferModified() ||
+			    image->track_addr != image->info.data.address ||
+			    image->track_addr_end != image->info.data.End()) {
+				reusable[i] = 0;
+				continue;
+			}
+			image->tick_accessed_last = tick;
+			TouchImage(*image);
+		}
+		++count;
+	}
+	return count;
+}
+
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
@@ -1486,6 +1548,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		image.stencil_subresources = {0, desc.info.resources.levels,
 		                             static_cast<uint32_t>(offset / slice_size),
 		                             desc.info.resources.layers};
+	}
+	if (image.info.stencil != desc.info.stencil || !(image.info.metadata == desc.info.metadata)) {
+		++image.layout_version;
 	}
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
