@@ -20,6 +20,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -1275,8 +1276,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
-	{
-		std::scoped_lock lock {m_lock};
+	for (bool reclaimed = false;; reclaimed = true) {
+		std::unique_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
@@ -1312,6 +1313,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = {};
 			}
 		}
+		if (!result && !reclaimed && NeedsMemoryReclaim(desc.info.data.size)) {
+			// Make room before creating the image, then look it up again.
+			lock.unlock();
+			ReclaimMemory(desc.info.data.size);
+			continue;
+		}
 		if (!result) {
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
@@ -1329,6 +1336,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		break;
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
@@ -1990,6 +1998,62 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 			continue;
 		}
 		FreeImage(id);
+	}
+}
+
+bool TextureCache::NeedsMemoryReclaim(uint64_t bytes) const {
+	return m_graphics.CanReportMemoryUsage() && m_critical_gc_memory != 0 &&
+	       m_graphics.GetDeviceMemoryUsage() + bytes >= m_critical_gc_memory;
+}
+
+void TextureCache::ReclaimMemory(uint64_t bytes) {
+	uint64_t freed  = 0;
+	uint32_t images = 0;
+	uint64_t usage  = 0;
+	size_t   cached = 0;
+	{
+		std::scoped_lock lock {m_lock};
+		usage = m_graphics.GetDeviceMemoryUsage();
+		// Free down to the pressure level so one reclaim covers many new images.
+		const auto target = usage + bytes > m_pressure_gc_memory
+		                        ? usage + bytes - m_pressure_gc_memory
+		                        : uint64_t {0};
+		std::vector<ImageId> candidates;
+		// Oldest first; images any draw touched this frame are left alone.
+		m_lru_cache.ForEachItemBelow(m_gc_tick, [&](ImageId id) {
+			candidates.push_back(id);
+			return false;
+		});
+		for (const auto id: candidates) {
+			if (freed >= target) {
+				break;
+			}
+			auto* owner = m_slot_images.try_get(id);
+			// Deleting depth also deletes its stencil association; leave both to the GC.
+			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			if (owner->IsGpuModified() && owner->SafeToDownload() && !DownloadImageMemory(id)) {
+				continue;
+			}
+			freed += owner->AccountedSize();
+			++images;
+			FreeImage(id);
+		}
+		m_slot_images.ForEach([&](ImageId, const Image&) { ++cached; });
+	}
+	static uint32_t reports = 0;
+	if (reports < 16) {
+		++reports;
+		std::printf("Texture cache: VRAM %" PRIu64 " MiB of %" PRIu64 " MiB in use; freed %" PRIu64
+		            " MiB from %u unused images (%zu cached)\n",
+		            usage >> 20u, m_critical_gc_memory >> 20u, freed >> 20u, images, cached);
+		std::fflush(stdout);
+	}
+	if (images != 0) {
+		// Deleted images and their downloads complete once the GPU finishes this submission.
+		m_scheduler.Wait(m_scheduler.CurrentTick());
+		m_scheduler.PopPendingOperations();
 	}
 }
 

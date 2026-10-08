@@ -162,6 +162,11 @@ private:
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// True when a new image of this many bytes would push device memory past the critical level.
+	[[nodiscard]] bool NeedsMemoryReclaim(uint64_t bytes) const;
+	// Frees images no draw used this frame, copying GPU-written contents back to guest memory
+	// first, and waits for the GPU so their memory is released. Caller must not hold m_lock.
+	void ReclaimMemory(uint64_t bytes);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
