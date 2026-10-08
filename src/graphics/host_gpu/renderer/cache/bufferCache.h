@@ -133,7 +133,8 @@ private:
 	// GPU thread only. The tick publishing an in-flight CPU-write copy that overlaps the range's
 	// pages, or 0.
 	[[nodiscard]] uint64_t PendingReadbackTick(uint64_t vaddr, uint64_t size) const;
-	void                   WaitForPendingReadbacks(uint64_t vaddr, uint64_t size);
+	// Waits for in-flight CPU-write copies overlapping the range's pages; true if there were any.
+	bool                   WaitForPendingReadbacks(uint64_t vaddr, uint64_t size);
 	void                   FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick);
 
 	GraphicContext&                                   m_graphics;

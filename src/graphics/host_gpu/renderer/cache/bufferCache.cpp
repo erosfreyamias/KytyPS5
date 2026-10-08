@@ -340,14 +340,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		WaitForPendingReadbacks(vaddr, size);
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		// A CPU-write copy in flight leaves its pages GPU-modified without dirty ranges; once it
+		// lands, guest memory holds those bytes and the pages can be released here too.
+		const bool landed = WaitForPendingReadbacks(vaddr, size);
+		auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		const auto start      = PerfStats::NowNanoseconds();
 		const bool downloaded = DownloadBufferMemory<false>(
 		    buffer, vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {});
 		PerfStats::CountReadback(source, downloaded, PerfStats::NowNanoseconds() - start);
-		if (downloaded) {
+		if (downloaded || landed) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
@@ -422,12 +424,15 @@ uint64_t BufferCache::PendingReadbackTick(uint64_t vaddr, uint64_t size) const {
 	return tick;
 }
 
-void BufferCache::WaitForPendingReadbacks(uint64_t vaddr, uint64_t size) {
-	if (const auto tick = PendingReadbackTick(vaddr, size); tick != 0) {
-		// A priority operation writes the copied bytes to guest memory once the copy finishes.
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
+bool BufferCache::WaitForPendingReadbacks(uint64_t vaddr, uint64_t size) {
+	const auto tick = PendingReadbackTick(vaddr, size);
+	if (tick == 0) {
+		return false;
 	}
+	// A priority operation writes the copied bytes to guest memory once the copy finishes.
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	return true;
 }
 
 void BufferCache::FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick) {
