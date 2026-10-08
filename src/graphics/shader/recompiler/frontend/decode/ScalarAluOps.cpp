@@ -143,9 +143,10 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.family    = Family::SOP1;
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(SOP1_OPS, opcode);
-	if (opcode == 0x21u && sdst == 125u) {
-		// S_SWAPPC_B64 with NULL discards the return PC, so it is a plain jump.
-		inst.opcode = Opcode::S_SETPC_B64;
+	if (opcode == 0x21u) {
+		// S_SWAPPC_B64 with NULL discards the return PC, so it is a plain jump. Otherwise it
+		// calls a function and keeps the return PC in sdst.
+		inst.opcode = sdst == 125u ? Opcode::S_SETPC_B64 : Opcode::S_SWAPPC_B64;
 	}
 	SetRawWords(inst, code, word_index, 1);
 
@@ -162,6 +163,12 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		case Opcode::S_SETPC_B64:
 			inst.src_count = 1;
 			inst.dst.kind  = OperandKind::Null;
+			DecodeScalarSource(ssrc0, pc, inst.src0);
+			ReadLiteralOperands(code, word_index, inst);
+			return;
+		case Opcode::S_SWAPPC_B64:
+			inst.src_count = 1;
+			DecodeScalarDestination(sdst, pc, inst.dst);
 			DecodeScalarSource(ssrc0, pc, inst.src0);
 			ReadLiteralOperands(code, word_index, inst);
 			return;

@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_SHADERCOMPILER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_SHADERCOMPILER_H_
 
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
@@ -20,6 +21,8 @@ struct ShaderParams {
 	uint32_t                  user_data_count = 0;
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
+	// Functions the shader calls, resolved from this draw's user data; hash covers their code.
+	std::span<const ShaderRecompiler::ShaderCallee> callees;
 
 	[[nodiscard]] uint64_t Base() const {
 		return reinterpret_cast<uint64_t>(code.data());

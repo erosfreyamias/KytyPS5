@@ -10329,6 +10329,55 @@ void TestNewShaderRecompilerSetpcBranch() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// PPSA03671 compute shaders call functions whose addresses arrive in user SGPRs. Each call is
+// inlined in place; returns branch to the instruction after the call.
+void TestShaderFunctionCallsInline() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeSMovB32(14, 8), EncodeSMovB32(15, 9),
+      0x7e080287u,             // v_mov_b32 v4, 7
+      EncodeSop1(0x21, 14, 14), // s_swappc_b64 s[14:15], s[14:15]
+      0xbf06800au,             // s_cmp_eq_u32 s10, 0
+      0xbf850004u,             // s_cbranch_scc1 over the second call
+      EncodeSMovB32(14, 8), EncodeSMovB32(15, 9),
+      0x7e080306u,             // v_mov_b32 v4, v6
+      EncodeSop1(0x21, 14, 14), 0xbf810000u,
+      0xdeadbeefu,             // data after s_endpgm is not code
+  };
+  const uint32_t callee[] = {
+      0x4a0c0881u,             // v_add_nc_u32 v6, 1, v4
+      0xbf06800au, 0xbf850001u, // s_cmp_eq_u32 s10, 0; s_cbranch_scc1 +1
+      0x7e0c0280u,             // v_mov_b32 v6, 0
+      EncodeSop1(0x04, 20, 14), // s_mov_b64 s[20:21], s[14:15]
+      EncodeSop1(0x20, 0, 20),  // s_setpc_b64 s[20:21]
+      0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u,
+  };
+  const auto calls = FindShaderCalls(shader);
+  Check(calls.size() == 2u && calls[0].pc == 0x0cu && calls[1].pc == 0x24u &&
+            calls[0].user_sgpr == 8u && calls[1].user_sgpr == 8u,
+        "calls through s[8:9] were not found");
+  const auto words = MeasureShaderFunction(callee);
+  Check(words == 6u, "the called function was not measured through its return");
+
+  const std::array callees{ShaderCallee{.pc = 0x0cu, .code = std::span(callee).first(words)},
+                           ShaderCallee{.pc = 0x24u, .code = std::span(callee).first(words)}};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.callees = callees;
+  auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("s_swappc") == std::string::npos &&
+            result.decoded_dump.find("S_SWAPPC") == std::string::npos,
+        "a call survived inlining");
+  // The first copy fills 0x0c..0x20, so the compare and branch move to 0x24/0x28 and the
+  // branch skips the second copy to the s_endpgm at 0x50.
+  Check(result.decoded_dump.find("0x00000028: S_CBRANCH_SCC1 0x00000050") != std::string::npos &&
+            result.decoded_dump.find("0x00000050: s_endpgm") != std::string::npos,
+        "a branch over an inlined call was not retargeted");
+  Check(result.ir_dump.find("loop_header=1") == std::string::npos,
+        "inlined calls introduced a loop");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestFusedShaderHandoffPreservesRegisters() {
   using namespace ShaderRecompiler;
   uint32_t front[] = {
@@ -15106,6 +15155,7 @@ int main() {
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestShaderFunctionCallsInline();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();

@@ -11,6 +11,25 @@
 
 namespace Libs::Graphics::ShaderRecompiler {
 
+// A function call (S_SWAPPC_B64) whose callee address the shader reads from user SGPRs.
+struct ShaderCallSite {
+	uint32_t pc        = 0; // byte offset of the S_SWAPPC_B64
+	uint32_t user_sgpr = 0; // the callee address is user_data[user_sgpr..user_sgpr + 1]
+};
+
+// The code a call site resolved to for one dispatch, through the callee's last return.
+struct ShaderCallee {
+	uint32_t                  pc = 0;
+	std::span<const uint32_t> code;
+};
+
+// Finds the function calls in a shader; empty when it makes none. Aborts when a call target
+// does not come from user SGPRs.
+[[nodiscard]] std::vector<ShaderCallSite> FindShaderCalls(std::span<const uint32_t> code);
+// Returns the number of words of the function at the start of code, through its last return,
+// or 0 when no return is found within code.
+[[nodiscard]] uint32_t MeasureShaderFunction(std::span<const uint32_t> code);
+
 struct CompileOptions {
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
@@ -21,6 +40,7 @@ struct CompileOptions {
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
+	std::span<const ShaderCallee> callees;
 	ShaderStageInputInfo        input_info;
 };
 

@@ -15,6 +15,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -93,6 +94,80 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, uint64_t hash,
 	        params.user_data_count > params.user_data.size());
 	std::copy(user_data.begin(), user_data.end(), params.user_data.begin() + user_data_base);
 	return params;
+}
+
+// Calls through function pointers in user SGPRs (PPSA03671 compute shaders call material
+// functions this way). Call sites are found once per shader and callees measured once per
+// address; game code is not rewritten while it runs.
+struct ShaderCallCache {
+	struct Function {
+		std::span<const uint32_t> code;
+		uint64_t                  hash = 0;
+	};
+	std::mutex                                                                  mutex;
+	std::unordered_map<uint64_t, std::vector<ShaderRecompiler::ShaderCallSite>> sites;
+	std::unordered_map<uint64_t, Function>                                      functions;
+	// Resolved callees by program hash; node storage keeps each vector in place.
+	std::unordered_map<uint64_t, std::vector<ShaderRecompiler::ShaderCallee>> resolved;
+};
+
+static ShaderCallCache& GetShaderCallCache() {
+	static ShaderCallCache cache;
+	return cache;
+}
+
+// Resolves the functions the shader calls for this draw and keys the program on their code.
+static void ResolveShaderCalls(ShaderParams& params) {
+	auto&            cache = GetShaderCallCache();
+	std::scoped_lock lock(cache.mutex);
+	auto             sites = cache.sites.find(params.hash);
+	if (sites == cache.sites.end()) {
+		sites = cache.sites.emplace(params.hash, ShaderRecompiler::FindShaderCalls(params.code))
+		            .first;
+	}
+	if (sites->second.empty()) {
+		return;
+	}
+	thread_local std::vector<ShaderRecompiler::ShaderCallee> callees;
+	thread_local std::vector<uint64_t>                       hashes;
+	callees.clear();
+	hashes.assign(1, params.hash);
+	for (const auto& call: sites->second) {
+		if (call.user_sgpr + 1u >= params.user_data_count) {
+			EXIT("shader 0x%016" PRIx64 " calls a function through s[%u:%u], beyond its %u user "
+			     "SGPRs\n",
+			     params.hash, call.user_sgpr, call.user_sgpr + 1u, params.user_data_count);
+		}
+		const auto address = static_cast<uint64_t>(params.user_data[call.user_sgpr]) |
+		                     (static_cast<uint64_t>(params.user_data[call.user_sgpr + 1u]) << 32u);
+		auto function = cache.functions.find(address);
+		if (function == cache.functions.end()) {
+			constexpr uint64_t MaxFunctionBytes = 256u * 1024u;
+			const auto mapped = address != 0 && (address & 3u) == 0
+			                        ? LibKernel::Memory::TryClampRangeSize(address, MaxFunctionBytes)
+			                        : 0;
+			const std::span<const uint32_t> available(reinterpret_cast<const uint32_t*>(address),
+			                                          mapped / sizeof(uint32_t));
+			const auto words = ShaderRecompiler::MeasureShaderFunction(available);
+			if (words == 0) {
+				EXIT("shader 0x%016" PRIx64 " calls a function at 0x%016" PRIx64
+				     " with no return in mapped memory\n",
+				     params.hash, address);
+			}
+			const auto code = available.first(words);
+			function        = cache.functions
+			               .emplace(address, ShaderCallCache::Function {
+			                                     code, XXH3_64bits(code.data(), code.size_bytes())})
+			               .first;
+			std::printf("Shader 0x%016" PRIx64 " calls a %u-word function at 0x%016" PRIx64 "\n",
+			            params.hash, words, address);
+			std::fflush(stdout);
+		}
+		callees.push_back({.pc = call.pc, .code = function->second.code});
+		hashes.push_back(function->second.hash);
+	}
+	params.hash    = XXH3_64bits(hashes.data(), hashes.size() * sizeof(uint64_t));
+	params.callees = cache.resolved.try_emplace(params.hash, callees).first->second;
 }
 
 #if 0
@@ -849,18 +924,22 @@ ShaderParams PrepareProgram(
     ShaderPixelInputInfo&                               ps_info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
-	return GetShaderParams(
+	auto params = GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
+	ResolveShaderCalls(params);
+	return params;
 }
 
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
-	return GetShaderParams(
+	auto params = GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
+	ResolveShaderCalls(params);
+	return params;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)

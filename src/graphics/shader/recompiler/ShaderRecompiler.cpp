@@ -479,7 +479,283 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// S_BRANCH from pc to target; both are byte offsets into the same code.
+uint32_t BranchWord(uint32_t pc, uint32_t target) {
+	const auto delta = (static_cast<int64_t>(target) - static_cast<int64_t>(pc) - 4) / 4;
+	if (delta < INT16_MIN || delta > INT16_MAX) {
+		EXIT("inlined function call at pc 0x%08x is too far from 0x%08x for S_BRANCH\n", pc, target);
+	}
+	return 0xbf820000u | (static_cast<uint32_t>(delta) & 0xffffu);
+}
+
+// The scalar registers an instruction may write, as [first, first + count). Widths round up, so a
+// resolved call target is never a register the shader changed.
+bool WrittenScalars(const Decoder::Instruction& inst, const Decoder::Operand& dst, uint32_t& first,
+                    uint32_t& count) {
+	if (dst.kind != Decoder::OperandKind::Sgpr) {
+		return false;
+	}
+	first = dst.reg;
+	if (inst.family == Decoder::Family::SMEM) {
+		count = std::max(inst.data_dwords, 1u);
+		return true;
+	}
+	const auto name = magic_enum::enum_name(inst.opcode);
+	const bool lane = inst.opcode == Decoder::Opcode::V_READFIRSTLANE_B32 ||
+	                  inst.opcode == Decoder::Opcode::V_READLANE_B32;
+	const bool vector = inst.family == Decoder::Family::VOP1 ||
+	                    inst.family == Decoder::Family::VOP2 ||
+	                    inst.family == Decoder::Family::VOP3 ||
+	                    inst.family == Decoder::Family::VOP3P || inst.family == Decoder::Family::VOPC;
+	const bool wide = name.find("_B64") != std::string_view::npos ||
+	                  name.find("_I64") != std::string_view::npos ||
+	                  name.find("_U64") != std::string_view::npos ||
+	                  name.find("_F64") != std::string_view::npos;
+	count = (vector && !lane) || wide ? 2u : 1u;
+	return true;
+}
+
+bool WritesScalar(const Decoder::Instruction& inst, uint32_t reg) {
+	for (const auto* dst: {&inst.dst, &inst.dst2}) {
+		uint32_t first = 0;
+		uint32_t count = 0;
+		if (WrittenScalars(inst, *dst, first, count) && reg >= first && reg < first + count) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool EndsBlock(Decoder::Opcode opcode) {
+	return Decoder::IsDirectBranch(opcode) || opcode == Decoder::Opcode::S_SETPC_B64 ||
+	       opcode == Decoder::Opcode::S_ENDPGM;
+}
+
+// Finds the user SGPR whose entry value reg holds at instruction index, or UINT32_MAX. Follows
+// S_MOV copies back through the instruction's block; before that, reg must keep its entry
+// value on every path, so no instruction ahead of index (or in a loop around it) writes it.
+uint32_t ResolveUserScalar(const Decoder::Program& program, const std::vector<bool>& labels,
+                           uint32_t index, uint32_t reg) {
+	const auto& insts = program.instructions;
+	for (uint32_t j = index; j-- > 0;) {
+		if (labels[insts[j + 1u].pc / 4u] || EndsBlock(insts[j].opcode)) {
+			break;
+		}
+		const auto& inst = insts[j];
+		if (!WritesScalar(inst, reg)) {
+			continue;
+		}
+		if (inst.src0.kind == Decoder::OperandKind::Sgpr &&
+		    (inst.opcode == Decoder::Opcode::S_MOV_B32 ||
+		     inst.opcode == Decoder::Opcode::S_MOV_B64)) {
+			return ResolveUserScalar(program, labels, j, inst.src0.reg + (reg - inst.dst.reg));
+		}
+		return UINT32_MAX;
+	}
+	const auto pc = insts[index].pc;
+	for (const auto& inst: insts) {
+		if (inst.pc >= pc) {
+			break;
+		}
+		if (WritesScalar(inst, reg)) {
+			return UINT32_MAX;
+		}
+	}
+	for (const auto& branch: insts) {
+		if (Decoder::IsDirectBranch(branch.opcode) && branch.branch_target <= pc &&
+		    branch.pc >= pc) {
+			for (const auto& inst: insts) {
+				if (inst.pc >= branch.branch_target && inst.pc <= branch.pc &&
+				    WritesScalar(inst, reg)) {
+					return UINT32_MAX;
+				}
+			}
+		}
+	}
+	return reg;
+}
+
+// Inlines a copy of the callee at each call site, so control only flows forward. Each return
+// becomes a branch to the instruction after the call, and the shader's branches are retargeted
+// to the moved instructions.
+Decoder::Program DecodeCallingProgram(std::span<const uint32_t> code,
+                                      std::span<const ShaderCallee> callees,
+                                      std::vector<uint32_t>& joined_code) {
+	Decoder::Program main;
+	Decoder::DecodeProgram(code, main);
+	for (const auto& inst: main.instructions) {
+		// Both address the shader's own code, which moves when callees are inlined.
+		if (inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+		    inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+			EXIT("shader with function calls also uses its code address (%s at pc 0x%08x)\n",
+			     std::string(magic_enum::enum_name(inst.opcode)).c_str(), inst.pc);
+		}
+	}
+	joined_code.clear();
+	struct MovedBranch {
+		uint32_t word;   // position in joined_code
+		uint32_t pc;     // original pc
+		uint32_t target; // original target
+	};
+	std::map<uint32_t, uint32_t> moved; // original pc -> inlined pc
+	std::vector<MovedBranch>     branches;
+	for (const auto& call: main.instructions) {
+		moved.emplace(call.pc, static_cast<uint32_t>(joined_code.size()) * 4u);
+		if (call.opcode != Decoder::Opcode::S_SWAPPC_B64) {
+			if (Decoder::IsDirectBranch(call.opcode)) {
+				if (call.word_count != 1u) {
+					EXIT("branch at pc 0x%08x has an unsupported encoding\n", call.pc);
+				}
+				branches.push_back(
+				    {static_cast<uint32_t>(joined_code.size()), call.pc, call.branch_target});
+			}
+			joined_code.insert(joined_code.end(), code.begin() + call.pc / 4u,
+			                   code.begin() + call.pc / 4u + call.word_count);
+			continue;
+		}
+		const auto callee = std::ranges::find(callees, call.pc, &ShaderCallee::pc);
+		if (callee == callees.end() || callee->code.empty()) {
+			EXIT("shader calls a function at pc 0x%08x whose address was not resolved\n", call.pc);
+		}
+		if (call.word_count != 1u || call.dst.kind != Decoder::OperandKind::Sgpr) {
+			EXIT("function call at pc 0x%08x has an unsupported encoding\n", call.pc);
+		}
+		const auto base_word = static_cast<uint32_t>(joined_code.size());
+		joined_code.insert(joined_code.end(), callee->code.begin(), callee->code.end());
+		const auto end_word = static_cast<uint32_t>(joined_code.size());
+		// Registers holding the return address; the callee may copy it before returning.
+		std::vector<uint32_t> returns {call.dst.reg, call.dst.reg + 1u};
+		const auto holds_return = [&](uint32_t reg) {
+			return std::ranges::find(returns, reg) != returns.end();
+		};
+		for (uint32_t word = base_word; word < end_word;) {
+			Decoder::Instruction inst;
+			Decoder::DecodeInstruction(joined_code, word, inst);
+			const auto offset = (word - base_word) * 4u;
+			word += inst.word_count;
+			switch (inst.opcode) {
+				case Decoder::Opcode::S_GETPC_B64:
+					EXIT("function called at pc 0x%08x reads its own address (S_GETPC_B64 at "
+					     "offset 0x%x)\n",
+					     call.pc, offset);
+					break;
+				case Decoder::Opcode::S_SWAPPC_B64:
+					EXIT("function called at pc 0x%08x makes a nested call at offset 0x%x\n",
+					     call.pc, offset);
+					break;
+				case Decoder::Opcode::S_MOV_B32:
+				case Decoder::Opcode::S_MOV_B64:
+					if (inst.src0.kind == Decoder::OperandKind::Sgpr &&
+					    inst.dst.kind == Decoder::OperandKind::Sgpr &&
+					    holds_return(inst.src0.reg)) {
+						returns.push_back(inst.dst.reg);
+						if (inst.opcode == Decoder::Opcode::S_MOV_B64 &&
+						    holds_return(inst.src0.reg + 1u)) {
+							returns.push_back(inst.dst.reg + 1u);
+						}
+					}
+					break;
+				case Decoder::Opcode::S_SETPC_B64:
+					if (inst.word_count != 1u || inst.src0.kind != Decoder::OperandKind::Sgpr ||
+					    !holds_return(inst.src0.reg) || !holds_return(inst.src0.reg + 1u)) {
+						EXIT("function called at pc 0x%08x jumps to a computed address at offset "
+						     "0x%x\n",
+						     call.pc, offset);
+					}
+					// Returns branch to the end of this copy, where the caller resumes.
+					joined_code[inst.pc / 4u] = BranchWord(inst.pc, end_word * 4u);
+					break;
+				default:
+					if (Decoder::IsDirectBranch(inst.opcode) &&
+					    (inst.branch_target < base_word * 4u ||
+					     inst.branch_target >= end_word * 4u)) {
+						EXIT("function called at pc 0x%08x branches outside itself at offset "
+						     "0x%x\n",
+						     call.pc, offset);
+					}
+					break;
+			}
+		}
+	}
+	const auto& last = main.instructions.back();
+	moved.emplace(last.pc + last.word_count * 4u, static_cast<uint32_t>(joined_code.size()) * 4u);
+	for (const auto& branch: branches) {
+		const auto target = moved.find(branch.target);
+		if (target == moved.end()) {
+			EXIT("branch at pc 0x%08x targets 0x%08x, which is not an instruction\n", branch.pc,
+			     branch.target);
+		}
+		joined_code[branch.word] = (joined_code[branch.word] & 0xffff0000u) |
+		                           (BranchWord(branch.word * 4u, target->second) & 0xffffu);
+	}
+	Decoder::Program result;
+	result.code = joined_code;
+	for (uint32_t word = 0; word < joined_code.size();) {
+		auto& inst = result.instructions.emplace_back();
+		Decoder::DecodeInstruction(joined_code, word, inst);
+		word += inst.word_count;
+	}
+	return result;
+}
+
 } // namespace
+
+std::vector<ShaderCallSite> FindShaderCalls(std::span<const uint32_t> code) {
+	Decoder::Program program;
+	Decoder::DecodeProgram(code, program);
+	std::vector<ShaderCallSite> calls;
+	if (std::ranges::none_of(program.instructions, [](const Decoder::Instruction& inst) {
+		    return inst.opcode == Decoder::Opcode::S_SWAPPC_B64;
+	    })) {
+		return calls;
+	}
+	std::vector<bool> labels(code.size() + 1u);
+	for (const auto& inst: program.instructions) {
+		if (Decoder::IsDirectBranch(inst.opcode) && inst.branch_target / 4u < labels.size()) {
+			labels[inst.branch_target / 4u] = true;
+		}
+	}
+	for (uint32_t index = 0; index < program.instructions.size(); ++index) {
+		const auto& inst = program.instructions[index];
+		if (inst.opcode != Decoder::Opcode::S_SWAPPC_B64) {
+			continue;
+		}
+		const auto low = inst.src0.kind == Decoder::OperandKind::Sgpr
+		                     ? ResolveUserScalar(program, labels, index, inst.src0.reg)
+		                     : UINT32_MAX;
+		const auto high = inst.src0.kind == Decoder::OperandKind::Sgpr
+		                      ? ResolveUserScalar(program, labels, index, inst.src0.reg + 1u)
+		                      : UINT32_MAX;
+		if (low == UINT32_MAX || high != low + 1u) {
+			EXIT("shader function call at pc 0x%08x takes its address from %s, not from user "
+			     "SGPRs\n",
+			     inst.pc, Decoder::OperandToString(inst.src0).c_str());
+		}
+		calls.push_back({.pc = inst.pc, .user_sgpr = low});
+	}
+	return calls;
+}
+
+uint32_t MeasureShaderFunction(std::span<const uint32_t> code) {
+	uint32_t furthest = 0;
+	for (uint32_t word = 0; word + Decoder::MaxInstructionRawWords <= code.size();) {
+		Decoder::Instruction inst;
+		Decoder::DecodeInstruction(code, word, inst);
+		if (inst.word_count == 0) {
+			return 0;
+		}
+		word += inst.word_count;
+		if (Decoder::IsDirectBranch(inst.opcode)) {
+			furthest = std::max(furthest, inst.branch_target / 4u);
+		}
+		if ((inst.opcode == Decoder::Opcode::S_SETPC_B64 ||
+		     inst.opcode == Decoder::Opcode::S_ENDPGM) &&
+		    furthest < word) {
+			return word;
+		}
+	}
+	return 0;
+}
 
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
@@ -514,8 +790,16 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		auto& handoff     = decoded.instructions.back();
 		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
 		handoff.src_count = 0;
+	} else if (!options.callees.empty()) {
+		decoded = DecodeCallingProgram(code, options.callees, joined_code);
 	} else {
 		Decoder::DecodeProgram(code, decoded);
+		for (const auto& inst: decoded.instructions) {
+			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64) {
+				EXIT("shader calls a function at pc 0x%08x whose address was not resolved\n",
+				     inst.pc);
+			}
+		}
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
