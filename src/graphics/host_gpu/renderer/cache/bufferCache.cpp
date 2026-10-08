@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -26,6 +27,28 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// A cached buffer can outlive part of the guest memory it covers: the game may unmap or protect
+// it while the buffer is still registered, and unmapping marks the range CPU-modified. Read the
+// backing directly (gaps read as zero, as on the GPU) instead of faulting on the guest view.
+void ReadGuestMemory(uint8_t* destination, uint64_t vaddr, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, destination, size)) {
+		return;
+	}
+	const auto mapped = Libs::LibKernel::Memory::TryClampRangeSize(vaddr, size);
+	if (mapped != size) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			std::printf("Warning: buffer upload [0x%" PRIx64 ", +0x%" PRIx64
+			            ") reaches unmapped guest memory; reading 0x%" PRIx64
+			            " mapped bytes and zero for the rest.\n",
+			            vaddr, size, mapped);
+		}
+	}
+	std::memcpy(destination, reinterpret_cast<const void*>(vaddr), mapped);
+	std::memset(destination + mapped, 0, size - mapped);
+}
 
 } // namespace
 
@@ -423,8 +446,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
-			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			ReadGuestMemory(mapped + copy.srcOffset, buffer.CpuAddress() + copy.dstOffset,
+			                copy.size);
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -434,9 +457,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
-		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		ReadGuestMemory(temporary->Mapped().data() + copy.srcOffset,
+		                buffer.CpuAddress() + copy.dstOffset, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();
@@ -459,7 +481,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			ReadGuestMemory(mapped, vaddr, size);
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}
