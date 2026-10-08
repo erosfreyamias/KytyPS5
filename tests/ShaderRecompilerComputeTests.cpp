@@ -2106,6 +2106,139 @@ public:
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
   }
 
+  // Local benchmark: the per-dispatch texture binding path for `count` distinct textures.
+  void BenchTextureBindings(uint32_t count, uint32_t iterations) {
+    constexpr const char *name = "BenchTextureBindings";
+    constexpr uintptr_t base = 0x0000000240000000ull;
+    constexpr uint64_t stride = 0x20000;
+    const uint64_t allocation_size =
+        ((uint64_t{count} * stride + 0x1fffffu) / 0x200000u) * 0x200000u;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x200000, 0, &direct_offset) == 0,
+            "bench allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x200000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "bench mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &executor = context.GetRenderExecutor();
+
+      ShaderRecompiler::IR::CompiledShaderInfo program{};
+      program.stage = ShaderType::Compute;
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.read = true;
+      program.info.images.assign(count, resource);
+      ShaderRecompiler::IR::DescriptorBinding image_binding{};
+      image_binding.kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
+      ShaderRecompiler::IR::ResourceSnapshot snapshot;
+      snapshot.images.resize(count);
+      for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t address = base + uint64_t{i} * stride;
+        ShaderTextureResource descriptor{{static_cast<uint32_t>(address >> 8u),
+            (static_cast<uint32_t>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) |
+                (3u << 30u), 0,
+            DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
+            0, 0x00700000u, 0, 0}};
+        snapshot.images[i].dword_count = 8;
+        std::copy_n(descriptor.fields, 8, snapshot.images[i].dwords.begin());
+        image_binding.resources.push_back(i);
+      }
+      program.bindings.descriptors.push_back(image_binding);
+      ShaderStageRuntime runtime{&program, &snapshot};
+
+      vk::DescriptorSetLayoutBinding layout_binding{
+          ShaderRecompiler::IR::NativeBinding(program.stage, image_binding.kind),
+          NativeDescriptorType(image_binding.kind), count, vk::ShaderStageFlagBits::eCompute};
+      vk::DescriptorSetLayoutCreateInfo layout_info{};
+      layout_info.bindingCount = 1;
+      layout_info.pBindings = &layout_binding;
+      PipelineCache::Pipeline pipeline{};
+      auto &device = context.GetGraphics().device;
+      Require(name, "layout",
+              device.createDescriptorSetLayout(&layout_info, nullptr,
+                                               &pipeline.descriptor_set_layout) ==
+                  vk::Result::eSuccess,
+              "descriptor set layout");
+      vk::PipelineLayoutCreateInfo pipeline_layout_info{};
+      vk::PushConstantRange push_range{vk::ShaderStageFlagBits::eCompute, 0,
+                                       sizeof(ShaderRecompiler::IR::PushData)};
+      pipeline_layout_info.setLayoutCount = 1;
+      pipeline_layout_info.pSetLayouts = &pipeline.descriptor_set_layout;
+      pipeline_layout_info.pushConstantRangeCount = 1;
+      pipeline_layout_info.pPushConstantRanges = &push_range;
+      Require(name, "pipeline layout",
+              device.createPipelineLayout(&pipeline_layout_info, nullptr,
+                                          &pipeline.pipeline_layout) == vk::Result::eSuccess,
+              "pipeline layout");
+      pipeline.uses_push_descriptors = false;
+
+      PreparedBindings prepared;
+      PreparedBindings *stage = &prepared;
+      using Clock = std::chrono::steady_clock;
+      double prepare_ms = 0, rebind_ms = 0, commit_ms = 0, reset_ms = 0;
+      const auto run = [&](bool timed) {
+        const auto t0 = Clock::now();
+        executor.PrepareBindings(runtime, prepared);
+        const auto t1 = Clock::now();
+        executor.FindBuffers(std::span{&stage, 1u});
+        executor.RebindImages(prepared);
+        executor.RebindBuffers(prepared);
+        const auto t2 = Clock::now();
+        executor.CommitBindings(scheduler.Current(), vk::PipelineBindPoint::eCompute, pipeline,
+                                std::span{&stage, 1u});
+        const auto t3 = Clock::now();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        const auto t4 = Clock::now();
+        if (timed) {
+          prepare_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+          rebind_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+          commit_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
+          reset_ms += std::chrono::duration<double, std::milli>(t4 - t3).count();
+        }
+      };
+      for (uint32_t i = 0; i < 3; ++i) run(false);
+      scheduler.Finish();
+      for (uint32_t i = 0; i < iterations; ++i) {
+        run(true);
+        if (i % 8 == 7) scheduler.Flush();
+      }
+      scheduler.Finish();
+      std::printf("[bench] %u textures x %u dispatches, per dispatch: prepare %.3f ms | "
+                  "rebind %.3f ms | commit %.3f ms | reset %.3f ms | total %.3f ms "
+                  "(%.2f us per texture)\n",
+                  count, iterations, prepare_ms / iterations, rebind_ms / iterations,
+                  commit_ms / iterations, reset_ms / iterations,
+                  (prepare_ms + rebind_ms + commit_ms + reset_ms) / iterations,
+                  (prepare_ms + rebind_ms + commit_ms + reset_ms) * 1000.0 /
+                      (double(iterations) * count));
+      device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+      device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+      context.UnmapMemory(base, allocation_size);
+    }
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0, "bench unmap");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                               allocation_size) == 0,
+            "bench release");
+  }
+
   void CheckGraphicsPushConstantBank() {
     constexpr const char *name = "GraphicsPushConstantStages";
     EnsureRuntimeContext();
@@ -41737,6 +41870,13 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc >= 2 && std::strcmp(argv[1], "--bind-bench") == 0) {
+    VulkanHarness vulkan;
+    const uint32_t count = argc >= 3 ? static_cast<uint32_t>(std::atoi(argv[2])) : 2048u;
+    const uint32_t iterations = argc >= 4 ? static_cast<uint32_t>(std::atoi(argv[3])) : 64u;
+    vulkan.BenchTextureBindings(count, iterations);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
