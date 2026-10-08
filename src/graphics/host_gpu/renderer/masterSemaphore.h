@@ -32,6 +32,9 @@ public:
 	void Wait(uint64_t tick);
 
 private:
+	// Exits with the device state after a semaphore query fails, which means the device was lost.
+	void ReportLostDevice(vk::Result result) const;
+
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};

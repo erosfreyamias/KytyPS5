@@ -165,10 +165,12 @@ private:
 	// True when a new image of this many bytes would push live device memory past the critical
 	// level, or total device memory past the budget.
 	[[nodiscard]] bool NeedsMemoryReclaim(uint64_t bytes) const;
-	// Frees images no draw used in the last two submissions, copying GPU-written contents back
-	// to guest memory first, and waits for the GPU so their memory is released. Caller must
-	// not hold m_lock.
+	// Frees images the current submission has not used, oldest first, copying GPU-written
+	// contents back to guest memory first, and waits for the GPU so their memory is released.
+	// Caller must not hold m_lock.
 	void ReclaimMemory(uint64_t bytes);
+	// Prints how device memory splits across image kinds. Caller holds m_lock.
+	void ReportMemoryUse() const;
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

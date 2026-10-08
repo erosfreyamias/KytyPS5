@@ -2034,9 +2034,12 @@ void TextureCache::ReclaimMemory(uint64_t bytes) {
 	constexpr uint64_t GiB    = 1024ull * 1024 * 1024;
 	uint64_t           freed  = 0;
 	uint32_t           images = 0;
-	uint64_t           live   = 0;
-	uint64_t           usage  = 0;
-	size_t             cached = 0;
+	uint64_t           live         = 0;
+	uint64_t           usage        = 0;
+	size_t             cached       = 0;
+	size_t             eligible     = 0;
+	uint32_t           kept         = 0;
+	static bool        reported_use = false;
 	{
 		std::scoped_lock lock {m_lock};
 		m_reclaim_tick    = m_gc_tick;
@@ -2051,10 +2054,10 @@ void TextureCache::ReclaimMemory(uint64_t bytes) {
 			target = std::max(target, usage + bytes - budget + GiB);
 		}
 		std::vector<ImageId> candidates;
-		// Oldest first. LRU ticks advance once per guest submission, and images used by the
-		// current or previous submission stay: the current draw may hold their IDs.
-		if (m_gc_tick >= 2) {
-			m_lru_cache.ForEachItemBelow(m_gc_tick - 2, [&](ImageId id) {
+		// Oldest first. LRU ticks advance once per guest submission; images the current
+		// submission used stay, since the current draw may hold their IDs.
+		if (m_gc_tick >= 1) {
+			m_lru_cache.ForEachItemBelow(m_gc_tick - 1, [&](ImageId id) {
 				candidates.push_back(id);
 				return false;
 			});
@@ -2066,16 +2069,23 @@ void TextureCache::ReclaimMemory(uint64_t bytes) {
 			auto* owner = m_slot_images.try_get(id);
 			// Deleting depth also deletes its stencil association; leave both to the GC.
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				++kept;
 				continue;
 			}
 			if (owner->IsGpuModified() && owner->SafeToDownload() && !DownloadImageMemory(id)) {
+				++kept;
 				continue;
 			}
 			freed += owner->AccountedSize();
 			++images;
 			FreeImage(id);
 		}
+		eligible = candidates.size();
 		m_slot_images.ForEach([&](ImageId, const Image&) { ++cached; });
+		if (!reported_use) {
+			reported_use = true;
+			ReportMemoryUse();
+		}
 	}
 	if (images != 0) {
 		// Deleted images and their downloads complete once the GPU finishes this submission.
@@ -2087,13 +2097,55 @@ void TextureCache::ReclaimMemory(uint64_t bytes) {
 		++reports;
 		std::printf("Texture cache: VRAM %" PRIu64 " MiB in use (%" PRIu64
 		            " MiB live, critical %" PRIu64 " MiB); freed %" PRIu64
-		            " MiB from %u unused images (%zu cached), now %" PRIu64 " MiB in use (%" PRIu64
-		            " MiB live)\n",
+		            " MiB from %u of %zu unused images (%u kept, %zu cached), now %" PRIu64
+		            " MiB in use (%" PRIu64 " MiB live)\n",
 		            usage >> 20u, live >> 20u, m_critical_gc_memory >> 20u, freed >> 20u, images,
-		            cached, m_graphics.GetDeviceMemoryUsage() >> 20u,
+		            eligible, kept, cached, m_graphics.GetDeviceMemoryUsage() >> 20u,
 		            m_graphics.GetDeviceMemoryLiveUsage() >> 20u);
 		std::fflush(stdout);
 	}
+}
+
+void TextureCache::ReportMemoryUse() const {
+	struct Group {
+		uint32_t count = 0;
+		uint64_t bytes = 0;
+		void     Add(uint64_t size) {
+			++count;
+			bytes += size;
+		}
+	};
+	Group targets;
+	Group depth;
+	Group storage;
+	Group textures;
+	Group    aliased;
+	uint64_t largest = 0;
+	m_slot_images.ForEach([&](ImageId, const Image& image) {
+		if (!image.registered) {
+			return;
+		}
+		const auto size = image.AccountedSize();
+		if (image.info.IsDepth() || image.usage.depth_target) {
+			depth.Add(size);
+		} else if (image.usage.render_target) {
+			targets.Add(size);
+		} else if (image.usage.storage) {
+			storage.Add(size);
+		} else {
+			textures.Add(size);
+		}
+		if (FindImagesInRegion(image.info.data.address, image.info.data.size, false).size() > 1) {
+			aliased.Add(size);
+		}
+		largest = std::max(largest, size);
+	});
+	std::printf("Texture cache: %u render targets (%" PRIu64 " MiB), %u depth (%" PRIu64
+	            " MiB), %u storage (%" PRIu64 " MiB), %u textures (%" PRIu64
+	            " MiB); %u overlap another image (%" PRIu64 " MiB); largest %" PRIu64 " MiB\n",
+	            targets.count, targets.bytes >> 20u, depth.count, depth.bytes >> 20u,
+	            storage.count, storage.bytes >> 20u, textures.count, textures.bytes >> 20u,
+	            aliased.count, aliased.bytes >> 20u, largest >> 20u);
 }
 
 void TextureCache::RunGarbageCollector() {
