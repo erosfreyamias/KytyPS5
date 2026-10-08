@@ -1561,9 +1561,19 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.mapping[memory.sampler][type];
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
-			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
-			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw);
+			if (image.indirect_root == memory.resource) {
+				switch (inst.GetOpcode()) {
+					case ValueOpcode::ImageSampleRaw:
+					case ValueOpcode::ImageGatherRaw:
+					case ValueOpcode::ImageRead:
+					case ValueOpcode::ImageQueryDimensions:
+					case ValueOpcode::ImageQueryLod: break;
+					default:
+						EXIT("indirect image table at pc 0x%08x is used by unsupported %s\n",
+						     image.first_use_pc,
+						     std::string(ValueOpcodeName(inst.GetOpcode())).c_str());
+				}
+			}
 		}
 	}
 	for (auto& memory: memory_info) {
