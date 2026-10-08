@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -163,7 +164,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-                                       GuestRange skip) {
+                                       GuestRange skip, bool* copied) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	bool                        gpu_written    = false;
@@ -190,6 +191,9 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
+	if (copied != nullptr) {
+		*copied = !copies.empty();
+	}
 	if (copies.empty()) {
 		return gpu_written;
 	}
@@ -324,6 +328,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	if (is_write && !GuestGpu::IsGpuThread()) {
+		ReadMemoryForCpuWrite(vaddr, size, overwritten);
+		return;
+	}
 	const auto source = overwritten ? PerfStats::Readback::FileRead
 	                    : is_write  ? PerfStats::Readback::CpuWrite
 	                                : PerfStats::t_readback_source;
@@ -332,6 +340,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
+		WaitForPendingReadbacks(vaddr, size);
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		const auto start      = PerfStats::NowNanoseconds();
@@ -345,6 +354,98 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+}
+
+void BufferCache::ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool overwritten) {
+	const auto source =
+	    overwritten ? PerfStats::Readback::FileRead : PerfStats::Readback::CpuWrite;
+	auto& gpu = m_scheduler.Context().GetGpu();
+	for (;;) {
+		uint64_t tick   = 0;
+		bool     queued = false;
+		gpu.SendCommandSync([&] {
+			if (!IsRegionRegistered(vaddr, size)) {
+				return;
+			}
+			if (const auto pending = PendingReadbackTick(vaddr, size); pending != 0) {
+				// Another thread's copy of these pages is in flight; wait for it, then retry.
+				tick = pending;
+				return;
+			}
+			auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+			const auto start  = PerfStats::NowNanoseconds();
+			bool       copied = false;
+			const bool gpu_written = DownloadBufferMemory<true>(
+			    buffer, vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {},
+			    &copied);
+			PerfStats::CountReadback(source, gpu_written, PerfStats::NowNanoseconds() - start);
+			if (copied) {
+				// Submit the copy now. Its pages stay GPU-modified, so the GPU thread neither
+				// uploads stale guest bytes over them nor drops a later GPU write.
+				tick = m_scheduler.CurrentTick();
+				m_scheduler.Flush();
+				m_pending_readbacks.push_back({vaddr, size, tick});
+				queued = true;
+				return;
+			}
+			if (gpu_written) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			}
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		});
+		if (tick == 0) {
+			return;
+		}
+		// The copy's priority operation writes the GPU bytes to guest memory.
+		m_scheduler.WaitPriorityOperations(tick);
+		if (queued) {
+			gpu.SendCommandSync([&] { FinishCpuWriteReadback(vaddr, size, tick); });
+			return;
+		}
+		// The other copy has landed; its thread finishes it shortly.
+		std::this_thread::yield();
+	}
+}
+
+uint64_t BufferCache::PendingReadbackTick(uint64_t vaddr, uint64_t size) const {
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	uint64_t   tick  = 0;
+	for (const auto& pending: m_pending_readbacks) {
+		const auto pending_begin = Common::AlignDown(pending.address, TRACKER_PAGE_SIZE);
+		const auto pending_end =
+		    Common::AlignUp(pending.address + pending.size, TRACKER_PAGE_SIZE);
+		if (begin < pending_end && pending_begin < end) {
+			tick = std::max(tick, pending.tick);
+		}
+	}
+	return tick;
+}
+
+void BufferCache::WaitForPendingReadbacks(uint64_t vaddr, uint64_t size) {
+	if (const auto tick = PendingReadbackTick(vaddr, size); tick != 0) {
+		// A priority operation writes the copied bytes to guest memory once the copy finishes.
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+}
+
+void BufferCache::FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick) {
+	std::erase_if(m_pending_readbacks, [&](const PendingReadback& pending) {
+		return pending.address == vaddr && pending.size == size && pending.tick == tick;
+	});
+	if (!IsRegionRegistered(vaddr, size)) {
+		return;
+	}
+	// A GPU write recorded after the copy keeps these pages GPU-owned. The CPU write then
+	// faults again and copies the newer bytes.
+	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (m_gpu_modified_ranges.Intersects(begin, end - begin)) {
+		return;
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -660,7 +761,9 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
-	return m_gpu_modified_ranges.Intersects(vaddr, size);
+	// Bytes of an in-flight CPU-write copy reach guest memory only once it lands.
+	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
+	       PendingReadbackTick(vaddr, size) != 0;
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -685,6 +788,10 @@ void BufferCache::RunGarbageCollector() {
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (PendingReadbackTick(buffer.CpuAddress(), buffer.Size()) != 0) {
+			// A CPU-write copy is in flight; its pages are GPU-modified without dirty ranges.
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());

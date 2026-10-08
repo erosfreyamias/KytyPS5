@@ -14,7 +14,8 @@ namespace Libs::Graphics::PerfStats {
 // overlap (a buffer lookup may wait for a readback), so the totals are approximate.
 enum class Stage : uint32_t { ResourceWalk, VariantLookup, Buffers, Images, Bindings, Readback, Count };
 
-// What asked for a GPU-to-CPU buffer readback. Each readback that downloads data waits for the GPU.
+// What asked for a GPU-to-CPU buffer readback. Readbacks for CPU and file writes make only the
+// writing thread wait for the GPU; the others also stall the GPU thread.
 enum class Readback : uint32_t {
 	CpuRead,
 	CpuWrite,

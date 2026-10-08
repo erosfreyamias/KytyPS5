@@ -123,10 +123,18 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	// Returns whether the range held GPU-written bytes. Those inside `skip` are dropped
-	// without a copy.
+	// without a copy; `copied` reports whether any bytes are being copied.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                        GuestRange skip = {});
+	                                        GuestRange skip = {}, bool* copied = nullptr);
+	// The CPU is about to write [vaddr, vaddr + size) from another thread. GPU-written bytes
+	// are copied back while the GPU thread keeps working; only the calling thread waits.
+	void ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool overwritten);
+	// GPU thread only. The tick publishing an in-flight CPU-write copy that overlaps the range's
+	// pages, or 0.
+	[[nodiscard]] uint64_t PendingReadbackTick(uint64_t vaddr, uint64_t size) const;
+	void                   WaitForPendingReadbacks(uint64_t vaddr, uint64_t size);
+	void                   FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -138,6 +146,14 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	struct PendingReadback {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+		uint64_t tick    = 0;
+	};
+	// CPU writes whose GPU-written bytes are still being copied to guest memory. Their pages
+	// stay GPU-modified until the copy lands. GPU thread only.
+	std::vector<PendingReadback>                      m_pending_readbacks;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
