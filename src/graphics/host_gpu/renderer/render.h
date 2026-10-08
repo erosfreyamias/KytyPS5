@@ -225,10 +225,6 @@ private:
 	// Guest ranges (address, size) written by the draw, gathered once per commit.
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
-	// Scratch for RebindImages.
-	std::vector<ImageId>  m_texture_ids;
-	std::vector<uint64_t> m_texture_layout_versions;
-	std::vector<uint8_t>  m_reacquired;
 	// Bindless tables bind the same descriptors draw after draw; decode each one once.
 	std::unordered_map<TextureDescKey, DecodedTextureDesc, TextureDescKeyHash> m_texture_descs;
 

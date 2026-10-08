@@ -153,9 +153,6 @@ public:
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
-	// Changes when an image is registered or unregistered on a page this one covers, or this
-	// one's description changes in place: the cases where a lookup could resolve differently.
-	uint64_t         layout_version     = 0;
 
 private:
 	friend struct ImageTestAccess;

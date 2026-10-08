@@ -543,8 +543,6 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
-	// Unique among the programs the pipeline cache compiled; 0 when it did not compile it.
-	uint64_t                      serial = 0;
 };
 
 struct UniformFillPlan {
