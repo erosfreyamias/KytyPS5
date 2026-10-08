@@ -106,8 +106,18 @@ uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memory
 	const auto minimum = Binary(state, spv::OpFSub, TypeF32(state),
 	                            LodFixed(ctx.Arg(inst, 3), 8), base);
 	const auto last = ConstantF32Value(state, static_cast<float>(mip_count - 1u));
+	// The S# LOD bias (signed 6.8) applies to explicit LODs too, as the host sampler's mipLodBias
+	// does for explicit-LOD sampling. A gather reads one level, so linear mip filtering selects
+	// the nearest level like point filtering.
+	const auto bias = Binary(
+	    state, spv::OpFMul, TypeF32(state),
+	    Unary(state, spv::OpConvertSToF, TypeF32(state),
+	          EmitBitFieldSExtract(state, sampler_control, ConstantU32(state, 0),
+	                               ConstantU32(state, 14))),
+	    ConstantF32Value(state, 1.0f / 256.0f));
 	auto lod = Binary(state, spv::OpFAdd, TypeF32(state),
-	                  AddressF32(ctx, mem, address, layout.lod),
+	                  Binary(state, spv::OpFAdd, TypeF32(state),
+	                         AddressF32(ctx, mem, address, layout.lod), bias),
 	                  Select(state, TypeF32(state), preclamp, half, zero));
 	lod = EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(
 	    state, lod, LodFixed(ctx.Arg(inst, 5), 0), LodFixed(ctx.Arg(inst, 5), 12));

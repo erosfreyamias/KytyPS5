@@ -2201,11 +2201,11 @@ void TestGatherLodSamplerValidation() {
         user_data[10] = control;
         ResourceSnapshot snapshot;
         ResourceSpecialization specialization;
-        const bool supported = !explicit_lod || (control >> 26u) == 0 ||
-                               control == (1u << 26u);
+        // PPSA03671 gathers with linear mip filtering; the shader applies the LOD bias.
+        const bool supported = !explicit_lod || (control >> 26u) != 3u;
         Check(MaterializeResources(plan, {.user_data = user_data}, snapshot,
                                    specialization) == supported,
-              "explicit gather accepted an unsupported sampler or rejected a valid one");
+              "explicit gather accepted an invalid mip filter or rejected a valid sampler");
       }
     }
   }
