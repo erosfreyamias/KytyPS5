@@ -822,6 +822,15 @@ static void WarnSpecializationReadOverlap(uint64_t read_address, uint64_t read_s
 	}
 }
 
+static void WarnUnmappedBuffer(const char* kind, uint64_t address, uint64_t size) {
+	static std::atomic_bool warned = false;
+	if (!warned.exchange(true, std::memory_order_relaxed)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Warning: {} buffer [0x{:x}, +0x{:x}) is not mapped; binding a null buffer.\n", kind,
+		    address, size));
+	}
+}
+
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	auto& cache = m_context.GetBufferCache();
@@ -865,7 +874,14 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			const auto requested_size = size;
+			size = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+			if (size == 0) {
+				// PPSA03671 binds stale V#s to unmapped memory; bind the null buffer like address 0.
+				WarnUnmappedBuffer("shader", address, requested_size);
+				prepared.buffer_sources.push_back({});
+				continue;
+			}
 			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 		}
 	}

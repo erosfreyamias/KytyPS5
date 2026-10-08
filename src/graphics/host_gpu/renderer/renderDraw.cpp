@@ -728,9 +728,20 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		auto& range = merged_ranges[i];
 		// PPSA20298
 		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		    Libs::LibKernel::Memory::TryClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
-		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
+		if (size == 0) {
+			// PPSA03671: an unmapped vertex range reads zero on the GPU; its slots get null buffers.
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: vertex buffer [0x{:x}, +0x{:x}) is not mapped; binding a null "
+				    "buffer.\n",
+				    range.base_address, range.RequestedSize()));
+			}
+			continue;
+		}
+		range.binding = cache.ObtainBuffer(range.base_address, size, false);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -752,11 +763,20 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		const auto range = std::find_if(merged_ranges.begin(), merged_ranges.begin() + merged_count,
 		                                [&](const VertexBufferRange& value) {
 			                                return vertex.addr >= value.base_address &&
-			                                       vertex.addr < value.acquired_end;
+			                                       vertex.addr < value.requested_end;
 		                                });
 		if (range == merged_ranges.begin() + merged_count) {
 			EXIT("vertex buffer address is outside the acquired range: addr=0x%016" PRIx64 "\n",
 			     vertex.addr);
+		}
+		if (vertex.addr >= range->acquired_end) {
+			// The slot lies in the unmapped part of its range.
+			if (null_buffer == nullptr) {
+				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
+			}
+			prepared.buffers[i] = null_buffer;
+			prepared.offsets[i] = 0;
+			continue;
 		}
 
 		prepared.buffers[i] = range->binding.first->Handle();
