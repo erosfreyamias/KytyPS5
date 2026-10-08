@@ -517,6 +517,65 @@ void TestRuntimeSelectedSamplerUsesDefault() {
   Check(matches, "a runtime-selected sampler did not use the default sampler words");
 }
 
+// PPSA03671 CS b8b17176ff277f18 clears a counter in one of two buffers chosen by a user-data
+// flag. The flag is not memory, so the shader's own write cannot change the selection and the
+// host selects the buffer. A flag read from memory stays unresolved in a writing shader.
+void TestUserDataSelectedWrittenBuffer() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  for (const bool memory_flag : {false, true}) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *alternate = fixture.AddBlock();
+    auto *merge = fixture.AddBlock();
+    entry->AddBranch(alternate);
+    entry->AddBranch(merge);
+    alternate->AddBranch(merge);
+    fixture.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1u, .false_block = 2u};
+    fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                                .true_block = 2u};
+    fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+    Value flag = fixture.UserData(2);
+    if (memory_flag) {
+      const auto control =
+          fixture.Buffer({Value(0x2000u), Value(0u), Value(200u), Value(0u)});
+      MemoryInfo scalar;
+      scalar.kind = ResourceKind::ScalarBuffer;
+      flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(196u)},
+                          fixture.AddMemory(scalar, 0x10));
+    }
+    fixture.program.block_info[0].condition =
+        fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
+    const auto first = fixture.UserData(4);
+    const auto second = fixture.Emit(ValueOpcode::GetUserData,
+                                     {Value(static_cast<ScalarReg>(5))}, 0, alternate);
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(entry, first);
+    phi.AddPhiOperand(alternate, second);
+    fixture.block = merge;
+    const auto buffer = fixture.Buffer(
+        {Value(&phi), fixture.UserData(6), Value(64u), Value(0x00016204u)}, 0x84);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {buffer, Value(0u), Value(0u), Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(memory, 0x84));
+    if (memory_flag) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "a writing shader selected its buffer from memory it may overwrite");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    const auto &info = fixture.program.info;
+    Check(info.buffers.size() == 1u && info.buffers[0].written,
+          "a user-data-selected written buffer was not tracked");
+    const auto *selected =
+        fixture.program.descriptor_sources[info.buffers[0].source].dwords[0].ResolveInstruction();
+    Check(selected != nullptr && selected->GetOpcode() == ValueOpcode::SelectU32,
+          "a user-data-selected written buffer did not select its base on the host");
+  }
+}
+
 void TestBoundedImageViewEligibility() {
   using Type = Libs::Graphics::Prospero::ImageType;
   auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
@@ -3825,6 +3884,7 @@ int main() {
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("indirect gather mixed mip counts", TestIndirectGatherMixedMipCounts);
     Run("runtime-selected sampler uses default", TestRuntimeSelectedSamplerUsesDefault);
+    Run("user-data-selected written buffer", TestUserDataSelectedWrittenBuffer);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

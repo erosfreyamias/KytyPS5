@@ -615,10 +615,31 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
+	// True when value is computed from user data and immediates alone, so no guest memory read
+	// (and thus no write by this shader) can change it during the dispatch.
+	static bool FromUserDataOnly(Value value, uint32_t depth = 0) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return true;
+		if (depth > 32u) return false;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::GetUserData) return true;
+		if (op == ValueOpcode::Phi || op == ValueOpcode::ReadConst ||
+		    op == ValueOpcode::GetSrtResource || BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+			return false;
+		}
+		for (size_t index = 0; index < inst->NumArgs(); ++index) {
+			if (!FromUserDataOnly(inst->Arg(index), depth + 1u)) return false;
+		}
+		return true;
+	}
+
 	Value LowerDescriptorPhi(Value value) {
 		value           = value.Resolve();
 		const auto* phi = value.TryInstruction();
-		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
 		    phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32 ||
 		    m_program.blocks.size() != m_program.block_info.size()) {
 			return value;
@@ -667,6 +688,12 @@ private:
 		}
 		const auto& info = m_program.block_info[branch_it - m_program.blocks.begin()];
 		const auto& term = info.terminator;
+		// A shader that writes memory could change a condition it reads from memory; a
+		// condition built from user data alone is fixed for the dispatch (PPSA03671 CS
+		// b8b17176ff277f18 picks the buffer it clears from a user-data flag).
+		if (m_shader_writes && !FromUserDataOnly(info.condition)) {
+			return value;
+		}
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == target_ids[0] && term.false_block == target_ids[1]) ||
 		      (term.false_block == target_ids[0] && term.true_block == target_ids[1])) ||
