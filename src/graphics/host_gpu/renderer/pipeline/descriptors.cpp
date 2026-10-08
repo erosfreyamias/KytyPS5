@@ -39,6 +39,7 @@
 #include <limits>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -542,23 +543,46 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
-	}
+size_t TextureDescKeyHash::operator()(const TextureDescKey& key) const noexcept {
+	static_assert(sizeof(TextureDescKey) == 12 * sizeof(uint32_t));
+	return static_cast<size_t>(XXH3_64bits(&key, sizeof(key)));
+}
+
+static TextureDescKey MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                                         const ShaderRecompiler::IR::DescriptorValue& value) {
+	TextureDescKey key;
+	key.dwords   = value.dwords;
+	key.usage[0] = value.dword_count | static_cast<uint32_t>(resource.resource_class) << 8u |
+	               static_cast<uint32_t>(resource.numeric_class) << 16u |
+	               static_cast<uint32_t>(resource.mip_mode) << 24u;
+	key.usage[1] = static_cast<uint32_t>(resource.dimension);
+	key.usage[2] = resource.mip_count;
+	key.usage[3] = static_cast<uint32_t>(resource.read) |
+	               static_cast<uint32_t>(resource.written) << 1u |
+	               static_cast<uint32_t>(resource.atomic) << 2u |
+	               static_cast<uint32_t>(resource.atomic64) << 3u |
+	               static_cast<uint32_t>(resource.depth_compare) << 4u |
+	               static_cast<uint32_t>(resource.cube) << 5u |
+	               static_cast<uint32_t>(resource.r128) << 6u;
+	return key;
+}
+
+// Decodes a texture descriptor into the guest image the shader reads. The result depends only
+// on the descriptor and the shader's use of it (MakeTextureDescKey), never on cache state.
+static DecodedTextureDesc DecodeTextureDesc(const ShaderRecompiler::IR::ImageResource&   resource,
+                                            const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
 
-	auto& texture_cache = m_context.GetTextureCache();
+	DecodedTextureDesc decoded {};
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		decoded.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                 : TextureCache::BindingType::Texture);
+		decoded.null_texture = true;
+		return decoded;
 	}
 
 	const auto address         = descriptor.Base40();
@@ -699,8 +723,49 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	decoded.desc              = std::move(desc);
+	decoded.pixel_format      = pixel_format;
+	decoded.view_format       = view_format;
+	decoded.size              = size.size;
+	decoded.shader_conversion = shader_conversion;
+	return decoded;
+}
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+const DecodedTextureDesc&
+RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	// Enough for every texture a frame binds; a full cache starts over instead of growing.
+	constexpr size_t MaxDecodedTextures = 32768;
+	const auto       key                = MakeTextureDescKey(resource, value);
+	if (const auto found = m_texture_descs.find(key); found != m_texture_descs.end()) {
+		return found->second;
+	}
+	auto decoded = DecodeTextureDesc(resource, value);
+	if (m_texture_descs.size() >= MaxDecodedTextures) {
+		m_texture_descs.clear();
+	}
+	return m_texture_descs.emplace(key, std::move(decoded)).first->second;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	const auto& decoded       = DecodeTexture(resource, value);
+	auto        desc          = decoded.desc;
+	auto&       texture_cache = m_context.GetTextureCache();
+	if (decoded.null_texture) {
+		const auto id = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	const auto descriptor   = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage      = resource.written;
+	const auto pixel_format = decoded.pixel_format;
+	const auto view_format  = decoded.view_format;
+	const auto size         = decoded.size;
+
+	auto       id                  = texture_cache.FindImage(desc, decoded.shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -710,7 +775,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
@@ -786,6 +851,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
+	PerfStats::CountImages(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {

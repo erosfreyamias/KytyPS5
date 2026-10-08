@@ -9,6 +9,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -24,6 +26,28 @@ struct TextureBinding {
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
+};
+
+// A texture descriptor and the shader's use of it, which decide its guest image description.
+struct TextureDescKey {
+	std::array<uint32_t, 8> dwords {};
+	std::array<uint32_t, 4> usage {};
+
+	bool operator==(const TextureDescKey& other) const = default;
+};
+
+struct TextureDescKeyHash {
+	size_t operator()(const TextureDescKey& key) const noexcept;
+};
+
+// The part of a texture lookup that depends only on its TextureDescKey.
+struct DecodedTextureDesc {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+	bool                    null_texture      = false;
+	bool                    shader_conversion = false;
 };
 
 struct PreparedBindings {

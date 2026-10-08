@@ -303,14 +303,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	const auto source =
+	    is_write ? PerfStats::Readback::CpuWrite : PerfStats::t_readback_source;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, source] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		const PerfStats::Scope timing(PerfStats::Stage::Readback);
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		const auto start      = PerfStats::NowNanoseconds();
+		const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
+		PerfStats::CountReadback(source, downloaded, PerfStats::NowNanoseconds() - start);
+		if (downloaded) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
