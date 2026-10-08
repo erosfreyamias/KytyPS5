@@ -207,7 +207,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t table_offset = 0,
-                         uint32_t table_shader_offset = 0, bool nested = false) {
+                         uint32_t table_shader_offset = 0, bool nested = false,
+                         bool gather_lod = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -270,9 +271,20 @@ MakeIndirectImageFixture(bool malformed, uint32_t table_stride = 32, uint32_t ta
   MemoryInfo sample;
   sample.kind = ResourceKind::Image;
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress()},
-                                     fixture->AddMemory(sample, 0x10f0));
+  Value sampled;
+  if (gather_lod) {
+    // An explicit-LOD gather selects its mip view at runtime from the T# and S# words.
+    sample.dmask = 1u;
+    sample.image_sample_flags = Decoder::ImageSampleFlagLod;
+    sampled = fixture->Emit(ValueOpcode::ImageGatherRaw,
+                            {image, sampler, fixture->ImageAddress(), image_words[1],
+                             image_words[3], Value(0u), Value(0u)},
+                            fixture->AddMemory(sample, 0x10f0));
+  } else {
+    sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
+                            {image, sampler, fixture->ImageAddress()},
+                            fixture->AddMemory(sample, 0x10f0));
+  }
   const auto sampled_x =
       fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
   fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
@@ -414,6 +426,64 @@ void TestNullScalarPointerDescriptor() {
             snapshot.images.size() == 1u &&
             std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
         "null SRT pointer did not materialize as a null image descriptor");
+}
+
+// PPSA03671 gathers with an explicit LOD through a bindless table whose textures have different
+// mip ranges. Each candidate keeps its own mip count and descriptor slots; the shader selects the
+// level from the chosen texture's own range.
+void TestIndirectGatherMixedMipCounts() {
+  using Type = Libs::Graphics::Prospero::ImageType;
+  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u, false, true);
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  Check(plan.info.images.size() == 1u &&
+            plan.info.images[0].mip_mode == ImageMipMode::Dynamic,
+        "explicit-LOD gather table did not track a dynamic-mip image");
+  std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u,
+                              0x2000u, 48u << 16u, 5u, 0u};
+  LinearTestMemory memory;
+  memory.fail_address = 0x3000u;
+  const auto descriptor = [](uint32_t identity, uint32_t base, uint32_t last) {
+    return std::array<uint32_t, 8>{identity, 75u << 20u, 3u | (3u << 14u),
+        Libs::Graphics::DstSel(4, 5, 6, 7) | (base << 12u) | (last << 16u) |
+            (static_cast<uint32_t>(Type::kColor2D) << 28u),
+        0u, 0u, 0u, 0u};
+  };
+  // Five textures: two levels, one level twice, levels 1..3 of a larger chain, two levels.
+  const std::array<std::array<uint32_t, 2>, 5> ranges{{{0u, 1u}, {0u, 0u}, {0u, 0u},
+                                                        {1u, 3u}, {0u, 1u}}};
+  for (uint32_t row = 0; row < ranges.size(); ++row) {
+    const auto value = descriptor(0x20u + row, ranges[row][0], ranges[row][1]);
+    std::copy(value.begin(), value.end(), memory.words.begin() + (0x1010u + row * 48u) / 4u);
+  }
+  SrtRuntime runtime{.user_data = data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "an image table with mixed mip counts was rejected");
+  std::vector<uint32_t> mips;
+  for (uint32_t index = 1; index < specialization.images.size(); ++index) {
+    Check(specialization.images[index].indirect_root == 0u,
+          "a mixed mip table candidate lost its root");
+    mips.push_back(specialization.images[index].mip_count);
+  }
+  std::ranges::sort(mips);
+  Check(mips == std::vector<uint32_t>{1u, 1u, 2u, 2u, 3u},
+        "mixed mip table candidates did not keep their own mip counts");
+  ApplyResourceSpecialization(fixture->program, specialization);
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture->program, {.compute = &compute});
+  AllocateBindings(fixture->program);
+  const auto &info = fixture->program.info;
+  uint32_t slots = 0;
+  for (uint32_t index = 1; index < info.images.size(); ++index) {
+    const auto *binding =
+        FindBinding(fixture->program.bindings, *DescriptorBindingForImage(info.images[index]));
+    Check(binding != nullptr, "a mixed mip table candidate has no image binding");
+    slots += static_cast<uint32_t>(std::ranges::count(binding->resources, index));
+  }
+  Check(slots == 9u, "mixed mip table candidates did not get one descriptor slot per level");
 }
 
 void TestBoundedImageViewEligibility() {
@@ -3710,6 +3780,7 @@ int main() {
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("null scalar pointer descriptor", TestNullScalarPointerDescriptor);
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
+    Run("indirect gather mixed mip counts", TestIndirectGatherMixedMipCounts);
     Run("waterfall image table", TestWaterfallImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

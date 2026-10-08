@@ -748,9 +748,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				continue;
 			}
 			if (NullImageDescriptor(snapshot.images[candidate])) {
+				// A null view has a single level, so it keeps its own mip count.
 				image.numeric_class     = image_class.numeric_class;
 				image.dimension         = image_class.dimension;
-				image.mip_count         = image_class.mip_count;
 				image.conversion_format = image_class.conversion_format;
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
@@ -758,14 +758,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
 			// The emitter samples, unpacks and bit-casts each candidate with its own numeric
-			// class, sampler class, conversion format and swizzle, so those may differ; the
-			// shared coordinates and mip selection may not.
+			// class, sampler class, conversion format, swizzle and mip views, so those may
+			// differ; the shared coordinates may not.
 			const char* mismatch = nullptr;
 			if (!same_coordinates &&
 			           !(is_2d(image.dimension) && is_2d(image_class.dimension))) {
 				mismatch = "dimension";
-			} else if (image.mip_count != image_class.mip_count) {
-				mismatch = "mip count";
 			}
 			if (mismatch != nullptr) {
 				const auto format = [&](uint32_t index) {
@@ -1564,7 +1562,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw);
 		}
 	}
 	for (auto& memory: memory_info) {
