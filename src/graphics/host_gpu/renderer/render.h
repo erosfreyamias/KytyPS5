@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -217,6 +218,9 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	// Guest ranges (address, size) written by the draw, gathered once per commit.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

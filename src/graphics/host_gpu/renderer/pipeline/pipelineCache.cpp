@@ -303,6 +303,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		// Draws mostly repeat one variant; it is tried before the others.
+		size_t last_hit = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -392,14 +394,24 @@ struct PipelineCache::ProgramCache {
 			}
 			const auto permutation = [&] {
 				const PerfStats::Scope timing(PerfStats::Stage::VariantLookup);
-				return std::ranges::find_if(
-				    entry->second.permutations, [&](const Permutation& candidate) {
-					    const auto& layout = candidate.program.bindings;
-					    return layout.push_data_start_dword ==
-					               ShaderRecompiler::IR::PushData::StartFor(
-					                   push_data_cursor, layout.ShaderDataDwords()) &&
-					           candidate.specialization == entry->second.specialization;
-				    });
+				// Each variant has a distinct key, so at most one matches.
+				const auto matches = [&](const Permutation& candidate) {
+					const auto& layout = candidate.program.bindings;
+					return layout.push_data_start_dword ==
+					           ShaderRecompiler::IR::PushData::StartFor(
+					               push_data_cursor, layout.ShaderDataDwords()) &&
+					       candidate.specialization == entry->second.specialization;
+				};
+				auto& permutations = entry->second.permutations;
+				auto& last_hit     = entry->second.last_hit;
+				if (last_hit < permutations.size() && matches(permutations[last_hit])) {
+					return permutations.begin() + static_cast<std::ptrdiff_t>(last_hit);
+				}
+				const auto found = std::ranges::find_if(permutations, matches);
+				if (found != permutations.end()) {
+					last_hit = static_cast<size_t>(found - permutations.begin());
+				}
+				return found;
 			}();
 			if (permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,

@@ -1881,11 +1881,15 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
-	if (!GuestRange {address, size}.Valid()) {
+	ImagePageTable::PageRange pages {};
+	if (!GuestRange {address, size}.Valid() ||
+	    !ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, true)) {
+	// Only images that start at address change, and every image is indexed on its first page,
+	// so one page probe finds them however large the written buffer is.
+	for (const auto id: FindImagesInRegion(address, 1, true)) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.address != address) {
 			continue;
