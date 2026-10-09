@@ -148,6 +148,7 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(m_operation_state != OperationState::Open);
 	}
+	g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
 	m_command.Bind(registers, user_config, shaders);
 
 	if (m_command.IsInvalid()) {

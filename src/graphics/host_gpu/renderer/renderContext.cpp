@@ -149,11 +149,20 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
+	m_fault_process_pending = true;
+	// Every cached buffer is synchronized so a shader reading memory through a device address
+	// sees the CPU's writes. Per draw that walk took ~38 % of the GPU thread on PPSA03671's title
+	// menu (Senaxx/KytyPS5 9d9d93b: 21 -> 32 fps). What the game wrote before submitting is
+	// visible to all its commands, as on the console, so once per guest submission is enough.
+	const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
+	if (submission == m_bda_synced_submission) {
+		return;
+	}
+	m_bda_synced_submission = submission;
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 	});
-	m_fault_process_pending = true;
 }
 
 void RenderContext::RunGarbageCollector() {

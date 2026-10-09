@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 
@@ -15,6 +16,9 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Bumped each time a guest command buffer begins (CommandScheduler::Begin).
+inline std::atomic<uint64_t> g_guest_submission_seq {1};
 
 class CommandScheduler {
 public:
