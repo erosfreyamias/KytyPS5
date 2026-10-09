@@ -109,6 +109,16 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	// The kernel unmaps every free range it is about to map, and most were never GPU-mapped.
+	// Buffers, images and GPU-written pages exist only inside mapped ranges, so such an unmap
+	// has nothing to invalidate: skip the round trip to the GPU thread. Ported from
+	// Senaxx/KytyPS5 9d25c3d.
+	if (GuestRange {vaddr, size}.Valid()) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
