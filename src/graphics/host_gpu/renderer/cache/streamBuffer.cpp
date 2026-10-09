@@ -6,6 +6,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -79,13 +82,42 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	const auto        create        = [&](const VmaAllocationCreateInfo& create_info) {
+        return static_cast<vk::Result>(vmaCreateBuffer(
+            graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &create_info,
+            &native_buffer, &m_allocation, &allocation_result));
+	};
+	auto result = create(allocation_info);
+	if (result != vk::Result::eSuccess) {
+		// The preferred heap is out of budget. As images do, take system memory and pay in
+		// bandwidth rather than stop; then the preferred heap past its budget, which the driver
+		// may serve by paging. Ported from Senaxx/KytyPS5 3cd1568.
+		auto spill           = allocation_info;
+		spill.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		spill.preferredFlags = 0;
+		const auto first     = result;
+		result               = create(spill);
+		const char* where    = "system memory";
+		if (result != vk::Result::eSuccess) {
+			auto over = allocation_info;
+			over.flags &= ~static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT);
+			result = create(over);
+			where  = "the preferred heap past its budget";
+		}
+		static std::atomic<uint32_t> spills {0};
+		if (spills.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::printf("Buffer spilled to %s: %" PRIu64 " MiB, usage %d, first attempt %s -> %s\n",
+			            where, static_cast<uint64_t>(size >> 20u), static_cast<int>(usage),
+			            vk::to_string(first).c_str(), vk::to_string(result).c_str());
+		}
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
+		EXIT("Out of memory: a %" PRIu64 " MiB GPU buffer fits neither in video memory nor in "
+		     "system memory (%s). Close other programs; if Windows' commit limit is reached, "
+		     "enlarge the page file.\n",
+		     static_cast<uint64_t>(size >> 20u), vk::to_string(result).c_str());
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
