@@ -392,8 +392,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		ReadMemoryForCpuWrite(vaddr, size, overwritten);
 		return;
 	}
+	// Writes from other threads took the path above, so a write here comes from the GPU thread.
 	const auto source = overwritten ? PerfStats::Readback::FileRead
-	                    : is_write  ? PerfStats::Readback::CpuWrite
+	                    : is_write  ? PerfStats::Readback::GpuThreadWrite
 	                                : PerfStats::t_readback_source;
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, overwritten,
 	                                                source] {
@@ -415,6 +416,31 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+}
+
+bool BufferCache::TryWriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size) {
+	// vkCmdUpdateBuffer-sized dword writes into one cached buffer, from the GPU thread.
+	if (!GuestGpu::IsGpuThread() || size == 0 || size > 65536 || ((vaddr | size) & 3u) != 0 ||
+	    !GuestRange {vaddr, size}.Valid() || !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	// An in-flight CPU-write copy would land later and overwrite these bytes with older ones.
+	if (PendingReadbackTick(vaddr, size) != 0) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size)) {
+		return false;
+	}
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	// Both copies now hold the bytes: guest memory directly and the buffer in command order,
+	// after the GPU work recorded so far. The page keeps its GPU-written ranges, which a later
+	// readback copies as before; these bytes in them read back the same.
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size);
+	return true;
 }
 
 void BufferCache::ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool overwritten) {

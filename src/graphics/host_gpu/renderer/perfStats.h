@@ -24,6 +24,8 @@ enum class Readback : uint32_t {
 	ColorClear,
 	IndirectArgs,
 	Other,
+	// The GPU thread itself stored into GPU-written memory.
+	GpuThreadWrite,
 	Count,
 };
 
@@ -131,9 +133,10 @@ inline void CountWork(bool dispatch) {
 	            draws, dispatches, images, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5]);
 	std::printf("Perf per second (readbacks): cpu read %.0f (%.0f ms) | cpu write %.0f (%.0f ms) | "
 	            "file read %.0f (%.0f ms) | shader setup %.0f (%.0f ms) | color clear %.0f (%.0f "
-	            "ms) | indirect args %.0f (%.0f ms) | other %.0f (%.0f ms)\n",
+	            "ms) | indirect args %.0f (%.0f ms) | other %.0f (%.0f ms) | gpu-thread write "
+	            "%.0f (%.0f ms)\n",
 	            count[0], wait[0], count[1], wait[1], count[2], wait[2], count[3], wait[3],
-	            count[4], wait[4], count[5], wait[5], count[6], wait[6]);
+	            count[4], wait[4], count[5], wait[5], count[6], wait[6], count[7], wait[7]);
 	std::fflush(stdout);
 }
 

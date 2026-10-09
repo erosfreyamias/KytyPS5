@@ -54,6 +54,10 @@ public:
 	// Like InvalidateMemory for a range the CPU is about to overwrite completely, such as a file
 	// read: GPU-written bytes inside it are not copied back, only those sharing its pages.
 	void                   InvalidateOverwrittenMemory(uint64_t vaddr, uint64_t size);
+	// GPU thread only. Stores into guest memory the GPU owns (command processor labels and
+	// WRITE_DATA payloads) without downloading the page, which would wait for every queued GPU
+	// command. Returns false when a plain store is the right path.
+	[[nodiscard]] bool     TryWriteGpuOwned(uint64_t vaddr, const void* data, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
 	                                  bool overwritten = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
