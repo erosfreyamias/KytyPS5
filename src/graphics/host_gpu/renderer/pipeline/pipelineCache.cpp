@@ -84,8 +84,12 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	// No emulator revision: the driver keys each pipeline on its full SPIR-V and state, so a new
+	// build reuses every pipeline whose shaders it still emits identically. Keying on the
+	// revision recompiled every pipeline after each update (seconds each for PPSA03671's large
+	// compute shaders).
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -686,8 +690,12 @@ void PipelineCache::InitializeDriverCache() {
 			file.Read(initial_data.data(), static_cast<uint32_t>(initial_data.size()),
 			          &payload_read);
 			file.Close();
+			// Entries of shaders no build emits any more pile up across updates; start over
+			// once the file is that large.
+			constexpr uint64_t MaxCacheBytes = uint64_t {1} << 30u;
 			if (signature_read != cached_signature.size() || hash_read != sizeof(payload_hash) ||
 			    payload_read != initial_data.size() || cached_signature != signature ||
+			    initial_data.size() > MaxCacheBytes ||
 			    XXH3_64bits(initial_data.data(), initial_data.size()) != payload_hash) {
 				initial_data.clear();
 				PipelineCacheLog(
