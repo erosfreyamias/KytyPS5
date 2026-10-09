@@ -18390,7 +18390,10 @@ private:
           features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
           features.pNext = &barycentric;
           physical.getFeatures2(&features);
-          if (barycentric.fragmentShaderBarycentric != true ||
+          // KYTY_TEST_SOFTWARE_DEVICE=1 accepts a device without fragment barycentrics or view
+          // min-LOD (e.g. llvmpipe) for host-side measurements such as --bind-bench.
+          const bool barycentrics_optional = std::getenv("KYTY_TEST_SOFTWARE_DEVICE") != nullptr;
+          if ((barycentric.fragmentShaderBarycentric != true && !barycentrics_optional) ||
               features.features.shaderInt64 != true ||
               features11.storageBuffer16BitAccess != true ||
               features12.storageBuffer8BitAccess != true ||
@@ -18479,7 +18482,8 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.shaderSampledImageArrayNonUniformIndexing == true,
             "nonuniform sampled image indexing is not supported");
-    Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
+    const bool software_device = std::getenv("KYTY_TEST_SOFTWARE_DEVICE") != nullptr;
+    Require("VulkanHarness", "dispatch", available_min_lod.minLod == true || software_device,
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
@@ -18522,7 +18526,7 @@ private:
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
-    barycentric.fragmentShaderBarycentric = true;
+    barycentric.fragmentShaderBarycentric = std::getenv("KYTY_TEST_SOFTWARE_DEVICE") == nullptr;
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
@@ -18555,11 +18559,11 @@ private:
       provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
     }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
-    min_lod.minLod = true;
+    min_lod.minLod = !software_device;
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
-    device_info.pNext = &min_lod;
+    device_info.pNext = software_device ? min_lod.pNext : static_cast<void *>(&min_lod);
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -18577,6 +18581,12 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+    if (software_device) {
+      std::erase_if(device_extensions, [](const char *extension) {
+        return std::string_view{extension} == VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME ||
+               std::string_view{extension} == VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME;
+      });
+    }
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -39389,7 +39399,8 @@ void CheckImageSamplerSpecialization() {
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
+                // The root, then the candidates padded to a power-of-two group.
+                snapshot.images.size() == 1u + std::bit_ceil(count),
             "GPU-selected material descriptors did not expand beyond native root capacity");
     const auto offset = specialization.images[0].indirect_mapping_offset;
     const auto ordinal = [&](u32 byte_offset) {

@@ -1360,7 +1360,7 @@ void TestBoundedComputeImageLoop() {
 
   // PPSA03671 streams textures into a table of hundreds of entries. Large tables pad their
   // candidates to a capacity bucket, so a few more entries reuse the same shader variant.
-  for (uint32_t key = 3u; key < 120u; ++key) {
+  for (uint32_t key = 3u; key < 140u; ++key) {
     const auto word = (table - memory.base) / 4u + key * 8u;
     memory.words[word] = 0x100u + key;
     memory.words[word + 1u] = static_cast<uint32_t>(
@@ -1370,7 +1370,7 @@ void TestBoundedComputeImageLoop() {
   }
   user_data[2] = 100u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 1u + 112u && specialization.images.size() == 1u + 112u &&
+            snapshot.images.size() == 1u + 128u && specialization.images.size() == 1u + 128u &&
             snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 100u &&
             snapshot.images[99].dwords[0] == 0x100u + 99u &&
             snapshot.images.back().dwords == snapshot.images[99].dwords,
@@ -1384,7 +1384,11 @@ void TestBoundedComputeImageLoop() {
         "growing a large image table within its bucket changed the shader variant");
   user_data[2] = 120u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 1u + 128u,
+            specialization.images.size() == 1u + 128u,
+        "growing a large image table within its power-of-two bucket changed its capacity");
+  user_data[2] = 130u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 1u + 256u,
         "large image table did not move to the next capacity bucket");
 
   // Large tables group candidates by class, so a cube texture streaming into a different slot

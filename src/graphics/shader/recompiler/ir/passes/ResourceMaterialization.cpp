@@ -41,15 +41,14 @@ void PadMappingRegion(std::vector<uint32_t>& flattened_srt, size_t mapping_offse
 // Such tables group their candidates by class and pad each group with copies of its last entry up
 // to a capacity bucket; no key maps to the padding.
 constexpr size_t MinPaddedIndirectCandidates = 64;
+constexpr size_t MinIndirectGroupCapacity    = 16;
 
-// Small groups round to a power of two; large ones to a quarter of their leading power of two,
-// keeping slack at or below 25%.
+// Every group rounds up to a power of two, at least 16. Each new bucket is a new shader variant
+// and recompiling one stalls the game for up to a second, while a padding slot only repeats the
+// previous slot's binding; PPSA03671 tables growing from 200 to 3500 textures compiled a variant
+// at every quarter step.
 size_t IndirectGroupCapacity(size_t count) {
-	if (count <= MinPaddedIndirectCandidates) {
-		return std::bit_ceil(count);
-	}
-	const auto step = std::bit_floor(count) / 4u;
-	return (count + step - 1u) / step * step;
+	return std::bit_ceil(std::max(count, MinIndirectGroupCapacity));
 }
 
 struct DescriptorValueHash {
