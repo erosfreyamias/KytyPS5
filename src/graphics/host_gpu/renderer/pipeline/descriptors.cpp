@@ -803,6 +803,16 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 	m_bound_images.push_back(id);
 }
 
+PreparedBindings& RenderExecutor::ComputeBindings(const ShaderStageRuntime& runtime) {
+	EXIT_IF(!runtime);
+	// Program variants live in vectors, so a key can outlive its program; a stale entry only
+	// costs memory and is dropped with the others once the map grows past its bound.
+	if (m_compute_bindings.size() >= 256 && !m_compute_bindings.contains(runtime.program)) {
+		m_compute_bindings.clear();
+	}
+	return m_compute_bindings[runtime.program];
+}
+
 void RenderExecutor::ResetBindings() {
 	for (const auto id: m_bound_images) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {

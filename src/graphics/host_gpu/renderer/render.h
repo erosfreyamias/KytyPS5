@@ -12,6 +12,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -203,6 +204,7 @@ private:
 	                                               std::span<PreparedBindings* const> stages = {});
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
+	[[nodiscard]] PreparedBindings& ComputeBindings(const ShaderStageRuntime& runtime);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
@@ -214,7 +216,9 @@ private:
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
-	PreparedBindings                     m_compute_bindings;
+	// Compute bindings are kept per program. One shared set was resized between each small
+	// dispatch and the next bindless one, destroying and rebuilding thousands of bindings.
+	std::unordered_map<const void*, PreparedBindings> m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
