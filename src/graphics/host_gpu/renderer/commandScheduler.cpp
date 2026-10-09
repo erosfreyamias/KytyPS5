@@ -233,8 +233,15 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 	QueueOperation(std::move(operation), true);
 }
 
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
-	CheckActive();
+void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
+	QueueOperation(std::move(operation), false, false);
+}
+
+void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority,
+                                      bool require_active) {
+	if (require_active) {
+		CheckActive();
+	}
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {

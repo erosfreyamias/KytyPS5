@@ -311,11 +311,10 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { ReleaseImage(id); });
-	} else {
-		m_slot_images.erase(id);
-	}
+	// Also between guest command buffers, where guest unmaps run: command buffers submitted
+	// just before may still sample the image. Destroying it at once lost the device a few
+	// seconds into PPSA03671's title scene (Senaxx/KytyPS5 1fef664, from Aftermath dumps).
+	m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
 }
 
 void TextureCache::ReleaseImage(ImageId id) {
@@ -331,7 +330,7 @@ void TextureCache::ReleaseImage(ImageId id) {
 			            image->info.extent.width, image->info.extent.height, image->info.data.address,
 			            image->tick_accessed_last);
 		}
-		m_scheduler.DeferOperation([this, id] { ReleaseImage(id); });
+		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
 		return;
 	}
 	m_slot_images.erase(id);

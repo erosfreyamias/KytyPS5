@@ -156,11 +156,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	Unregister(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { ReleaseBuffer(id); });
-	} else {
-		m_slot_buffers.erase(id);
-	}
+	// As TextureCache::DeleteImage: earlier command buffers may still use the buffer.
+	m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
 }
 
 void BufferCache::ReleaseBuffer(BufferId id) {
@@ -174,7 +171,7 @@ void BufferCache::ReleaseBuffer(BufferId id) {
 			            " after its release; destroying it once that tick is done\n",
 			            buffer->CpuAddress(), buffer->Size(), buffer->last_use_tick);
 		}
-		m_scheduler.DeferOperation([this, id] { ReleaseBuffer(id); });
+		m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
 		return;
 	}
 	m_slot_buffers.erase(id);
