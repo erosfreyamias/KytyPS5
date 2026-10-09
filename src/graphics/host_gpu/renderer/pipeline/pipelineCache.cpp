@@ -30,7 +30,9 @@
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
+#include <future>
 #include <limits>
+#include <memory>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string>
@@ -306,7 +308,76 @@ struct PipelineCache::ProgramCache {
 		std::vector<Permutation>                    permutations;
 		// Draws mostly repeat one variant; it is tried before the others.
 		size_t last_hit = 0;
+		// How long translating this program took on the GPU thread.
+		ShaderClock::duration translate_time {};
+		// The next variant's translation, made ahead of time on a worker (see TranslateSpare).
+		std::future<ShaderRecompiler::TranslateResult> spare;
 	};
+
+	// Translation depends on the program alone (its key), never on the resource specialization.
+	// A program with a large bindless table is specialized again whenever a streamed table
+	// outgrows its capacity bucket, and translating PPSA03671's largest ones takes up to a second
+	// of GPU-thread time each, several programs at a time. A worker translates the next variant's
+	// copy ahead, so only the specialized compile is left on the GPU thread.
+	static constexpr auto SpareTranslationThreshold = std::chrono::milliseconds(50);
+
+	[[nodiscard]] static bool WantsSpareTranslation(const SourceEntry& entry) {
+		if (entry.translate_time < SpareTranslationThreshold) {
+			return false;
+		}
+		if (entry.permutations.size() >= 2) {
+			return true;
+		}
+		using ShaderRecompiler::IR::ImageResource;
+		const auto table_images = std::ranges::count_if(
+		    entry.specialization.images, [](const auto& image) {
+			    return image.indirect_root != ImageResource::NoIndirectImage;
+		    });
+		return table_images > 64;
+	}
+
+	template <typename InputInfo>
+	[[nodiscard]] static std::future<ShaderRecompiler::TranslateResult>
+	TranslateSpare(const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
+	               const InputInfo& input_info) {
+		// The worker owns copies of everything the options point at: guest code can be unmapped
+		// and the input info lives on the caller's stack.
+		struct Inputs {
+			std::vector<uint32_t>                       code;
+			std::vector<uint32_t>                       back_code;
+			std::vector<uint32_t>                       user_data;
+			std::vector<std::vector<uint32_t>>          callee_code;
+			std::vector<ShaderRecompiler::ShaderCallee> callees;
+			InputInfo                                   input_info;
+			ShaderRecompiler::CompileOptions            options;
+		};
+		auto inputs = std::make_shared<Inputs>(Inputs {
+		    .code       = {params.code.begin(), params.code.end()},
+		    .back_code  = {options.back_code.begin(), options.back_code.end()},
+		    .user_data  = {options.user_data.begin(), options.user_data.end()},
+		    .input_info = input_info,
+		    .options    = options,
+		});
+		inputs->callee_code.reserve(options.callees.size());
+		for (const auto& callee: options.callees) {
+			inputs->callee_code.emplace_back(callee.code.begin(), callee.code.end());
+			inputs->callees.push_back({.pc = callee.pc, .code = inputs->callee_code.back()});
+		}
+		auto& copied     = inputs->options;
+		copied.back_code = inputs->back_code;
+		copied.user_data = inputs->user_data;
+		copied.callees   = inputs->callees;
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			copied.input_info.vertex = &inputs->input_info;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			copied.input_info.pixel = &inputs->input_info;
+		} else {
+			copied.input_info.compute = &inputs->input_info;
+		}
+		return std::async(std::launch::async, [inputs = std::move(inputs)] {
+			return ShaderRecompiler::TranslateProgram(inputs->code, inputs->options);
+		});
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -472,7 +543,9 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		const auto translate_start = ShaderClock::now();
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		const bool use_spare = entry != programs.end() && entry->second.spare.valid();
+		auto       translated = use_spare ? entry->second.spare.get()
+		                                  : ShaderRecompiler::TranslateProgram(params.code, options);
 		const auto translate_time  = ShaderClock::now() - translate_start;
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
@@ -481,8 +554,15 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
+		if (!use_spare) {
+			entry->second.translate_time = translate_time;
+		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		// Dumps are written by the translating thread; keep them in order on the GPU thread.
+		if (!options.dump_ir && WantsSpareTranslation(entry->second)) {
+			entry->second.spare = TranslateSpare(params, options, input_info);
+		}
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);

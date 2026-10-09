@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <fmt/format.h>
@@ -2172,9 +2173,9 @@ private:
 			// on a default sampler instead of aborting: wrap addressing, bilinear filtering
 			// with linear mips over the full LOD range. Explicit-LOD gathers still read the
 			// real S# words on the GPU.
-			static bool warned = false;
-			if (!warned) {
-				warned = true;
+			// Programs are also translated on worker threads.
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
 				std::printf("Warning: shader 0x%016" PRIx64 " pc=0x%08x selects its sampler at "
 				            "runtime; using a default linear wrap sampler.\n",
 				            m_program.shader_hash, pc);
