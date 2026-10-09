@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -156,10 +157,27 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		m_scheduler.DeferOperation([this, id] { ReleaseBuffer(id); });
 	} else {
 		m_slot_buffers.erase(id);
 	}
+}
+
+void BufferCache::ReleaseBuffer(BufferId id) {
+	// As TextureCache::ReleaseImage: a later tick may have bound the buffer after its release
+	// was queued.
+	const auto* buffer = m_slot_buffers.try_get(id);
+	if (buffer != nullptr && !m_scheduler.IsFree(buffer->last_use_tick)) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Buffer cache: buffer at 0x%016" PRIx64 "+0x%" PRIx64 " used in tick %" PRIu64
+			            " after its release; destroying it once that tick is done\n",
+			            buffer->CpuAddress(), buffer->Size(), buffer->last_use_tick);
+		}
+		m_scheduler.DeferOperation([this, id] { ReleaseBuffer(id); });
+		return;
+	}
+	m_slot_buffers.erase(id);
 }
 
 template <bool async>
@@ -694,6 +712,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	buffer.last_use_tick = m_scheduler.CurrentTick();
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
@@ -710,6 +729,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
+			buffer.last_use_tick = m_scheduler.CurrentTick();
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
 			return {&buffer, buffer.Offset(vaddr)};
 		}

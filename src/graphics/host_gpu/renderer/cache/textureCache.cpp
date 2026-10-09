@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstdio>
@@ -311,10 +312,29 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferOperation([this, id] { ReleaseImage(id); });
 	} else {
 		m_slot_images.erase(id);
 	}
+}
+
+void TextureCache::ReleaseImage(ImageId id) {
+	// A draw or dispatch recorded after the release was queued can still have used the image,
+	// in a tick later than the one the release waited for; destroying it then crashes the GPU.
+	// Same rule as Senaxx/KytyPS5's wolverine branch, where Aftermath dumps showed it.
+	const auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && !m_scheduler.IsFree(image->tick_accessed_last)) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Texture cache: image %ux%u at 0x%016" PRIx64 " used in tick %" PRIu64
+			            " after its release; destroying it once that tick is done\n",
+			            image->info.extent.width, image->info.extent.height, image->info.data.address,
+			            image->tick_accessed_last);
+		}
+		m_scheduler.DeferOperation([this, id] { ReleaseImage(id); });
+		return;
+	}
+	m_slot_images.erase(id);
 }
 
 void TextureCache::FreeImage(ImageId id) {

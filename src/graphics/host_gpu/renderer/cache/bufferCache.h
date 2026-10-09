@@ -90,6 +90,8 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
+	// Destroys a deleted buffer once the GPU has finished the last tick that used it.
+	void ReleaseBuffer(BufferId id);
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;
