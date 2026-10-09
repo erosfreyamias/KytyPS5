@@ -57,7 +57,13 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 
 	m_sets.clear();
 	auto& fresh_batch = m_sets[layout];
-	EXIT_IF(!Allocate(layout, fresh_batch));
+	// A set bigger than a whole default pool gets a pool scaled to fit it.
+	for (uint32_t scale = 2; !Allocate(layout, fresh_batch); scale *= 2) {
+		EXIT_IF(scale > 64);
+		m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
+		CreateDescriptorPool(scale);
+		fresh_batch = {};
+	}
 	return fresh_batch.sets[--fresh_batch.size];
 }
 
@@ -85,11 +91,15 @@ bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
 	}
 }
 
-void DescriptorHeap::CreateDescriptorPool() {
+void DescriptorHeap::CreateDescriptorPool(uint32_t scale) {
+	auto sizes = DescriptorPoolSizes;
+	for (auto& size: sizes) {
+		size.descriptorCount *= scale;
+	}
 	vk::DescriptorPoolCreateInfo create {};
-	create.maxSets       = DescriptorHeapCount;
-	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
-	create.pPoolSizes    = DescriptorPoolSizes.data();
+	create.maxSets       = DescriptorHeapCount * scale;
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
 	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
 	        vk::Result::eSuccess);
 }

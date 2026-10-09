@@ -2070,8 +2070,10 @@ void TextureCache::ReclaimMemory(uint64_t bytes) {
 				break;
 			}
 			auto* owner = m_slot_images.try_get(id);
-			// Deleting depth also deletes its stencil association; leave both to the GC.
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			// Deleting depth also deletes its stencil association; leave both to the GC. The draw
+			// being prepared holds the IDs of the images it has bound so far.
+			if (owner == nullptr || !owner->registered || owner->depth_id ||
+			    owner->binding.is_bound || owner->binding.is_target) {
 				++kept;
 				continue;
 			}

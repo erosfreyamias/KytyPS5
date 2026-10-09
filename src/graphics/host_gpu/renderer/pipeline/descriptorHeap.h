@@ -31,7 +31,7 @@ private:
 	};
 
 	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
-	void               CreateDescriptorPool();
+	void               CreateDescriptorPool(uint32_t scale = 1);
 
 	GraphicContext&                                     m_graphics;
 	MasterSemaphore&                                    m_master_semaphore;

@@ -739,8 +739,10 @@ void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&  
 	auto*      image               = &texture_cache.m_slot_images[id];
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
-		id    = image->depth_id;
-		image = &texture_cache.m_slot_images[id];
+		id = image->depth_id;
+		// FindImage touched only the association. The depth image this binding holds must be
+		// in the current submission's LRU tick too, or a reclaim later in this draw can free it.
+		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
@@ -781,7 +783,8 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 }
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
-	// The lookup that produced the ID already touched the image in the LRU.
+	// ResolveTexture already touched the image in the LRU, including the depth image a stencil
+	// association redirects to.
 	auto& image = m_context.GetTextureCache().m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;
@@ -1178,6 +1181,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			// A padded slot repeating the previous one shares its image, range and access; a
+			// second Transit would only add a write-after-write barrier for storage images.
+			if (RepeatsPreviousTexture(program, *prepared->runtime->resources, i)) {
+				descriptors.images[i].layout = descriptors.images[i - 1].layout;
+				continue;
+			}
 			auto& image   = m_context.GetTextureCache().m_slot_images[descriptors.images[i].image_id];
 			auto& binding = descriptors.images[i];
 			const auto&                 view = binding.desc.view_info;
