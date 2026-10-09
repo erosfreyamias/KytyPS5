@@ -341,17 +341,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 			return;
 		}
 		// A CPU-write copy in flight leaves its pages GPU-modified without dirty ranges; once it
-		// lands, guest memory holds those bytes and the pages can be released here too.
-		const bool landed = WaitForPendingReadbacks(vaddr, size);
-		auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		// lands, guest memory holds those bytes.
+		(void)WaitForPendingReadbacks(vaddr, size);
+		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		const auto start      = PerfStats::NowNanoseconds();
 		const bool downloaded = DownloadBufferMemory<false>(
 		    buffer, vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {});
 		PerfStats::CountReadback(source, downloaded, PerfStats::NowNanoseconds() - start);
-		if (downloaded || landed) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-		}
+		// Guest memory now holds every GPU-written byte of these pages, so they are released
+		// even when they held none: a page left GPU-modified would fault forever.
+		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
@@ -361,7 +361,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 void BufferCache::ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool overwritten) {
 	const auto source =
 	    overwritten ? PerfStats::Readback::FileRead : PerfStats::Readback::CpuWrite;
-	auto& gpu = m_scheduler.Context().GetGpu();
+	auto&    gpu    = m_scheduler.Context().GetGpu();
+	uint64_t landed = 0;
 	for (;;) {
 		uint64_t tick   = 0;
 		bool     queued = false;
@@ -369,17 +370,23 @@ void BufferCache::ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool over
 			if (!IsRegionRegistered(vaddr, size)) {
 				return;
 			}
-			if (const auto pending = PendingReadbackTick(vaddr, size); pending != 0) {
-				// Another thread's copy of these pages is in flight; wait for it, then retry.
+			if (const auto pending = PendingReadbackTick(vaddr, size); pending > landed) {
+				// Another thread's copy of these pages is in flight; wait for it, then release.
 				tick = pending;
 				return;
 			}
 			auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 			const auto start  = PerfStats::NowNanoseconds();
 			bool       copied = false;
-			const bool gpu_written = DownloadBufferMemory<true>(
-			    buffer, vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {},
-			    &copied);
+			// Pages of a copy that already landed are not copied again: their entry belongs
+			// to the thread that queued it, which releases them too.
+			const bool gpu_written =
+			    landed == 0 ? DownloadBufferMemory<true>(
+			                      buffer, vaddr, size,
+			                      overwritten ? GuestRange {vaddr, size} : GuestRange {}, &copied)
+			                : DownloadBufferMemory<false>(
+			                      buffer, vaddr, size,
+			                      overwritten ? GuestRange {vaddr, size} : GuestRange {});
 			PerfStats::CountReadback(source, gpu_written, PerfStats::NowNanoseconds() - start);
 			if (copied) {
 				// Submit the copy now. Its pages stay GPU-modified, so the GPU thread neither
@@ -390,9 +397,7 @@ void BufferCache::ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool over
 				queued = true;
 				return;
 			}
-			if (gpu_written) {
-				m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-			}
+			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		});
 		if (tick == 0) {
@@ -401,11 +406,11 @@ void BufferCache::ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool over
 		// The copy's priority operation writes the GPU bytes to guest memory.
 		m_scheduler.WaitPriorityOperations(tick);
 		if (queued) {
-			gpu.SendCommandSync([&] { FinishCpuWriteReadback(vaddr, size, tick); });
+			gpu.SendCommandSync([&] { FinishCpuWriteReadback(vaddr, size, tick, overwritten); });
 			return;
 		}
-		// The other copy has landed; its thread finishes it shortly.
-		std::this_thread::yield();
+		// The other copy has landed: release the pages now instead of waiting for its thread.
+		landed = tick;
 	}
 }
 
@@ -435,20 +440,20 @@ bool BufferCache::WaitForPendingReadbacks(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
-void BufferCache::FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick) {
+void BufferCache::FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick,
+                                         bool overwritten) {
 	std::erase_if(m_pending_readbacks, [&](const PendingReadback& pending) {
 		return pending.address == vaddr && pending.size == size && pending.tick == tick;
 	});
 	if (!IsRegionRegistered(vaddr, size)) {
 		return;
 	}
-	// A GPU write recorded after the copy keeps these pages GPU-owned. The CPU write then
-	// faults again and copies the newer bytes.
-	const auto begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
-	if (m_gpu_modified_ranges.Intersects(begin, end - begin)) {
-		return;
-	}
+	// The GPU may have written these pages again after the copy was recorded. Those bytes are
+	// downloaded here, so the pages always end CPU-owned: a page left GPU-modified without
+	// dirty bytes would never be released.
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	(void)DownloadBufferMemory<false>(buffer, vaddr, size,
+	                                  overwritten ? GuestRange {vaddr, size} : GuestRange {});
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
@@ -804,7 +809,7 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
+			(void)DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size());
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());

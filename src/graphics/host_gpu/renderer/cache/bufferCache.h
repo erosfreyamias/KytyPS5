@@ -134,8 +134,9 @@ private:
 	// pages, or 0.
 	[[nodiscard]] uint64_t PendingReadbackTick(uint64_t vaddr, uint64_t size) const;
 	// Waits for in-flight CPU-write copies overlapping the range's pages; true if there were any.
-	bool                   WaitForPendingReadbacks(uint64_t vaddr, uint64_t size);
-	void                   FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick);
+	bool WaitForPendingReadbacks(uint64_t vaddr, uint64_t size);
+	// Retires a landed CPU-write copy and hands its pages to the CPU.
+	void FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick, bool overwritten);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
