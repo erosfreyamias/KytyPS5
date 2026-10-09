@@ -258,6 +258,36 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+template <bool async>
+bool BufferCache::DownloadRange(uint64_t vaddr, uint64_t size, GuestRange skip, bool* copied) {
+	// Every GPU-written page belongs to a cached buffer. Merging the range into one buffer
+	// instead, as FindBuffer does, would allocate and copy a buffer the size of a whole file
+	// read just to download a few pages.
+	bool gpu_written = false;
+	if (copied != nullptr) {
+		*copied = false;
+	}
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start >= finish) {
+			continue;
+		}
+		bool buffer_copied = false;
+		gpu_written |= DownloadBufferMemory<async>(buffer, start, finish - start, skip, &buffer_copied);
+		if (copied != nullptr) {
+			*copied |= buffer_copied;
+		}
+	}
+	return gpu_written;
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -343,11 +373,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		// A CPU-write copy in flight leaves its pages GPU-modified without dirty ranges; once it
 		// lands, guest memory holds those bytes.
 		(void)WaitForPendingReadbacks(vaddr, size);
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		const auto start      = PerfStats::NowNanoseconds();
-		const bool downloaded = DownloadBufferMemory<false>(
-		    buffer, vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {});
+		const bool downloaded = DownloadRange<false>(
+		    vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {});
 		PerfStats::CountReadback(source, downloaded, PerfStats::NowNanoseconds() - start);
 		// Guest memory now holds every GPU-written byte of these pages, so they are released
 		// even when they held none: a page left GPU-modified would fault forever.
@@ -375,18 +404,13 @@ void BufferCache::ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool over
 				tick = pending;
 				return;
 			}
-			auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 			const auto start  = PerfStats::NowNanoseconds();
+			const auto skip   = overwritten ? GuestRange {vaddr, size} : GuestRange {};
 			bool       copied = false;
 			// Pages of a copy that already landed are not copied again: their entry belongs
 			// to the thread that queued it, which releases them too.
-			const bool gpu_written =
-			    landed == 0 ? DownloadBufferMemory<true>(
-			                      buffer, vaddr, size,
-			                      overwritten ? GuestRange {vaddr, size} : GuestRange {}, &copied)
-			                : DownloadBufferMemory<false>(
-			                      buffer, vaddr, size,
-			                      overwritten ? GuestRange {vaddr, size} : GuestRange {});
+			const bool gpu_written = landed == 0 ? DownloadRange<true>(vaddr, size, skip, &copied)
+			                                     : DownloadRange<false>(vaddr, size, skip);
 			PerfStats::CountReadback(source, gpu_written, PerfStats::NowNanoseconds() - start);
 			if (copied) {
 				// Submit the copy now. Its pages stay GPU-modified, so the GPU thread neither
@@ -451,9 +475,7 @@ void BufferCache::FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t
 	// The GPU may have written these pages again after the copy was recorded. Those bytes are
 	// downloaded here, so the pages always end CPU-owned: a page left GPU-modified without
 	// dirty bytes would never be released.
-	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-	(void)DownloadBufferMemory<false>(buffer, vaddr, size,
-	                                  overwritten ? GuestRange {vaddr, size} : GuestRange {});
+	(void)DownloadRange<false>(vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {});
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }

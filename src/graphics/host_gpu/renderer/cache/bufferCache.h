@@ -127,6 +127,9 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                        GuestRange skip = {}, bool* copied = nullptr);
+	// DownloadBufferMemory over every cached buffer intersecting the range; never creates one.
+	template <bool async>
+	bool DownloadRange(uint64_t vaddr, uint64_t size, GuestRange skip = {}, bool* copied = nullptr);
 	// The CPU is about to write [vaddr, vaddr + size) from another thread. GPU-written bytes
 	// are copied back while the GPU thread keeps working; only the calling thread waits.
 	void ReadMemoryForCpuWrite(uint64_t vaddr, uint64_t size, bool overwritten);
