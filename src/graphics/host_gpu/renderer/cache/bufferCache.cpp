@@ -178,8 +178,13 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	};
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
-		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
-		                                           "buffer download");
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+		    // Pages of a CPU-write copy stay GPU-modified without dirty bytes until released.
+		    if (PendingReadbackTick(address, bytes) == 0) {
+			    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+			                                           "buffer download");
+		    }
+#endif
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    gpu_written = true;
 			    if (skip.size == 0 || end <= skip.address || start >= skip.End()) {
@@ -263,12 +268,10 @@ bool BufferCache::DownloadRange(uint64_t vaddr, uint64_t size, GuestRange skip, 
 	// Every GPU-written page belongs to a cached buffer. Merging the range into one buffer
 	// instead, as FindBuffer does, would allocate and copy a buffer the size of a whole file
 	// read just to download a few pages.
-	bool gpu_written = false;
-	if (copied != nullptr) {
-		*copied = false;
-	}
-	const auto end = vaddr + size;
-	auto       it  = m_buffers.upper_bound(vaddr);
+	bool       gpu_written = false;
+	bool       any_copied  = false;
+	const auto end         = vaddr + size;
+	auto       it          = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
 		--it;
 	}
@@ -280,10 +283,19 @@ bool BufferCache::DownloadRange(uint64_t vaddr, uint64_t size, GuestRange skip, 
 			continue;
 		}
 		bool buffer_copied = false;
-		gpu_written |= DownloadBufferMemory<async>(buffer, start, finish - start, skip, &buffer_copied);
-		if (copied != nullptr) {
-			*copied |= buffer_copied;
+		gpu_written |= DownloadBufferMemory<true>(buffer, start, finish - start, skip, &buffer_copied);
+		any_copied |= buffer_copied;
+	}
+	if constexpr (!async) {
+		// One wait publishes every buffer's copy.
+		if (any_copied) {
+			const auto tick = m_scheduler.CurrentTick();
+			m_scheduler.Wait(tick);
+			m_scheduler.WaitPriorityOperations(tick);
 		}
+	}
+	if (copied != nullptr) {
+		*copied = any_copied;
 	}
 	return gpu_written;
 }
@@ -466,18 +478,18 @@ bool BufferCache::WaitForPendingReadbacks(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::FinishCpuWriteReadback(uint64_t vaddr, uint64_t size, uint64_t tick,
                                          bool overwritten) {
+	if (IsRegionRegistered(vaddr, size)) {
+		// The GPU may have written these pages again after the copy was recorded. Those bytes
+		// are downloaded here, so the pages always end CPU-owned: a page left GPU-modified
+		// without dirty bytes would never be released. The entry stays listed until then.
+		(void)DownloadRange<false>(vaddr, size,
+		                           overwritten ? GuestRange {vaddr, size} : GuestRange {});
+		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
 	std::erase_if(m_pending_readbacks, [&](const PendingReadback& pending) {
 		return pending.address == vaddr && pending.size == size && pending.tick == tick;
 	});
-	if (!IsRegionRegistered(vaddr, size)) {
-		return;
-	}
-	// The GPU may have written these pages again after the copy was recorded. Those bytes are
-	// downloaded here, so the pages always end CPU-owned: a page left GPU-modified without
-	// dirty bytes would never be released.
-	(void)DownloadRange<false>(vaddr, size, overwritten ? GuestRange {vaddr, size} : GuestRange {});
-	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
