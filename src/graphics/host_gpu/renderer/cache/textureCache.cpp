@@ -283,7 +283,9 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	if (!image->depth_id) {
+	// Only depth images that were given a stencil association need the scan; deleting other
+	// images used to scan every cached image.
+	if (!image->depth_id && image->has_stencil_association) {
 		std::vector<ImageId> associations;
 		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
 			if (associated.depth_id == id) {
@@ -1261,6 +1263,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
+	m_slot_images[depth_id].has_stencil_association = true;
 	record.depth_id             = depth_id;
 	record.stencil_subresources = depth.stencil_subresources;
 	return association;

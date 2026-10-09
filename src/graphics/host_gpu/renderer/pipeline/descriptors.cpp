@@ -39,7 +39,6 @@
 #include <limits>
 #include <span>
 #include <vector>
-#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -543,44 +542,21 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
-size_t TextureDescKeyHash::operator()(const TextureDescKey& key) const noexcept {
-	static_assert(sizeof(TextureDescKey) == 12 * sizeof(uint32_t));
-	return static_cast<size_t>(XXH3_64bits(&key, sizeof(key)));
-}
-
-static TextureDescKey MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
-                                         const ShaderRecompiler::IR::DescriptorValue& value) {
-	TextureDescKey key;
-	key.dwords   = value.dwords;
-	key.usage[0] = value.dword_count | static_cast<uint32_t>(resource.resource_class) << 8u |
-	               static_cast<uint32_t>(resource.numeric_class) << 16u |
-	               static_cast<uint32_t>(resource.mip_mode) << 24u;
-	key.usage[1] = static_cast<uint32_t>(resource.dimension);
-	key.usage[2] = resource.mip_count;
-	key.usage[3] = static_cast<uint32_t>(resource.read) |
-	               static_cast<uint32_t>(resource.written) << 1u |
-	               static_cast<uint32_t>(resource.atomic) << 2u |
-	               static_cast<uint32_t>(resource.atomic64) << 3u |
-	               static_cast<uint32_t>(resource.depth_compare) << 4u |
-	               static_cast<uint32_t>(resource.cube) << 5u |
-	               static_cast<uint32_t>(resource.r128) << 6u;
-	return key;
-}
-
 // Decodes a texture descriptor into the guest image the shader reads. The result depends only
-// on the descriptor and the shader's use of it (MakeTextureDescKey), never on cache state.
-static DecodedTextureDesc DecodeTextureDesc(const ShaderRecompiler::IR::ImageResource&   resource,
-                                            const ShaderRecompiler::IR::DescriptorValue& value) {
+// on the descriptor and the shader's use of it, never on cache state.
+static TextureDecode DecodeTextureDesc(const ShaderRecompiler::IR::ImageResource&   resource,
+                                       const ShaderRecompiler::IR::DescriptorValue& value,
+                                       TextureCache::ImageDesc&                     desc) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
 		ValidateStorageImageResource(resource);
 	}
 
-	DecodedTextureDesc decoded {};
+	TextureDecode decoded {};
 	if (descriptor.IsNull()) {
-		decoded.desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                 : TextureCache::BindingType::Texture);
+		desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                         : TextureCache::BindingType::Texture);
 		decoded.null_texture = true;
 		return decoded;
 	}
@@ -692,7 +668,7 @@ static DecodedTextureDesc DecodeTextureDesc(const ShaderRecompiler::IR::ImageRes
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
-	TextureCache::ImageDesc desc {};
+	desc                   = {};
 	desc.info.data         = {address, size.size};
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
@@ -723,7 +699,6 @@ static DecodedTextureDesc DecodeTextureDesc(const ShaderRecompiler::IR::ImageRes
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
-	decoded.desc              = std::move(desc);
 	decoded.pixel_format      = pixel_format;
 	decoded.view_format       = view_format;
 	decoded.size              = size.size;
@@ -731,33 +706,28 @@ static DecodedTextureDesc DecodeTextureDesc(const ShaderRecompiler::IR::ImageRes
 	return decoded;
 }
 
-const DecodedTextureDesc&
-RenderExecutor::DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	// Enough for every texture a frame binds; a full cache starts over instead of growing.
-	constexpr size_t MaxDecodedTextures = 32768;
-	const auto       key                = MakeTextureDescKey(resource, value);
-	if (const auto found = m_texture_descs.find(key); found != m_texture_descs.end()) {
-		return found->second;
-	}
-	auto decoded = DecodeTextureDesc(resource, value);
-	if (m_texture_descs.size() >= MaxDecodedTextures) {
-		m_texture_descs.clear();
-	}
-	return m_texture_descs.emplace(key, std::move(decoded)).first->second;
-}
-
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	TextureBinding binding;
+	ResolveTexture(resource, value, binding);
+	return binding;
+}
+
+void RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                    const ShaderRecompiler::IR::DescriptorValue& value,
+                                    TextureBinding&                              binding) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
 	}
-	const auto& decoded       = DecodeTexture(resource, value);
-	auto        desc          = decoded.desc;
+	// The binding is filled in place: bindless stages resolve thousands of these per draw.
+	binding.image_view    = nullptr;
+	binding.layout        = vk::ImageLayout::eUndefined;
+	auto&       desc      = binding.desc;
+	const auto  decoded   = DecodeTextureDesc(resource, value, desc);
 	auto&       texture_cache = m_context.GetTextureCache();
 	if (decoded.null_texture) {
-		const auto id = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		binding.image_id = texture_cache.FindImage(desc);
+		return;
 	}
 	const auto descriptor   = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage      = resource.written;
@@ -766,11 +736,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto size         = decoded.size;
 
 	auto       id                  = texture_cache.FindImage(desc, decoded.shader_conversion);
-	auto*      image               = &texture_cache.GetImage(id);
+	auto*      image               = &texture_cache.m_slot_images[id];
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
 		id    = image->depth_id;
-		image = &texture_cache.GetImage(id);
+		image = &texture_cache.m_slot_images[id];
 	} else if (image->info.IsDepth()) {
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
@@ -782,7 +752,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	binding.image_id = id;
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -811,7 +781,8 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 }
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
-	auto& image = m_context.GetTextureCache().GetImage(id);
+	// The lookup that produced the ID already touched the image in the LRU.
+	auto& image = m_context.GetTextureCache().m_slot_images[id];
 	if (image.info.data.Empty()) {
 		return;
 	}
@@ -838,6 +809,24 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+// A padded bindless table repeats each group's last descriptor up to its capacity. Such a slot
+// resolves exactly like the one before it when the shader uses both the same way.
+static bool RepeatsPreviousTexture(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                   const ShaderRecompiler::IR::ResourceSnapshot&    snapshot,
+                                   uint32_t                                         index) {
+	if (index == 0 || !(snapshot.images[index] == snapshot.images[index - 1])) {
+		return false;
+	}
+	const auto& a = program.info.images[index];
+	const auto& b = program.info.images[index - 1];
+	return a.resource_class == b.resource_class && a.numeric_class == b.numeric_class &&
+	       a.dimension == b.dimension && a.mip_mode == b.mip_mode && a.mip_count == b.mip_count &&
+	       a.conversion_format == b.conversion_format && a.shader_swizzle == b.shader_swizzle &&
+	       a.read == b.read && a.written == b.written && a.atomic == b.atomic &&
+	       a.atomic64 == b.atomic64 && a.depth_compare == b.depth_compare && a.cube == b.cube &&
+	       a.r128 == b.r128;
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -855,11 +844,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
-		binding.mip_views.swap(prepared.images[i].mip_views);
+		auto& binding = prepared.images[i];
 		binding.mip_views.clear();
-		prepared.images[i] = std::move(binding);
+		if (RepeatsPreviousTexture(program, snapshot, i)) {
+			binding = prepared.images[i - 1];
+			continue;
+		}
+		ResolveTexture(program.info.images[i], snapshot.images[i], binding);
+		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 	}
 	prepared.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -1006,13 +998,17 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto& texture_cache = m_context.GetTextureCache();
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (RepeatsPreviousTexture(program, snapshot, i)) {
+			images[i] = images[i - 1];
+			continue;
+		}
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			ResolveTexture(program.info.images[i], snapshot.images[i], images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
@@ -1035,7 +1031,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		} else {
 			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
-		auto&      image   = texture_cache.GetImage(binding.image_id);
+		auto&      image   = texture_cache.m_slot_images[binding.image_id];
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
@@ -1182,7 +1178,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
+			auto& image   = m_context.GetTextureCache().m_slot_images[descriptors.images[i].image_id];
 			auto& binding = descriptors.images[i];
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,

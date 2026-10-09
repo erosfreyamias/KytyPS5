@@ -142,6 +142,10 @@ public:
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
+	// The last FindView request and its view: rebinding a texture repeats the same request,
+	// which then skips normalizing it and searching the views.
+	ImageViewInfo    last_view_request;
+	vk::ImageView    last_view = nullptr;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
@@ -149,6 +153,8 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// Set on a depth image once a stencil association points at it.
+	bool             has_stencil_association = false;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
@@ -156,6 +162,8 @@ public:
 
 private:
 	friend struct ImageTestAccess;
+
+	[[nodiscard]] vk::ImageView FindViewUncached(const ImageViewInfo& view_info);
 
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,

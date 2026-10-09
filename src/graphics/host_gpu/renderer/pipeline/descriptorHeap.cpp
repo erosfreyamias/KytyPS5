@@ -9,11 +9,14 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint32_t   DescriptorHeapCount = 1024;
+// Bindless stages bind thousands of images per set (PPSA03671: up to 6,418). Pools sized for a
+// handful of sets were exhausted almost every draw, which recreated or reset a pool and dropped
+// every cached set.
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 16384},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 65536},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 4096},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 4096},
 };
 
 } // namespace

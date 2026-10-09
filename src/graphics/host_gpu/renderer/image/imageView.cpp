@@ -307,6 +307,15 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 } // namespace ImageViewOps
 
 vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+	if (last_view != nullptr && last_view_request == view_info) {
+		return last_view;
+	}
+	last_view_request = view_info;
+	last_view         = FindViewUncached(view_info);
+	return last_view;
+}
+
+vk::ImageView Image::FindViewUncached(const ImageViewInfo& view_info) {
 	const auto& image      = backing;
 	auto        normalized = view_info;
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);

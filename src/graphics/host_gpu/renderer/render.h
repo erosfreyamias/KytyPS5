@@ -12,7 +12,6 @@
 #include <array>
 #include <optional>
 #include <span>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -181,9 +180,8 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] const DecodedTextureDesc&
-	DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	              const ShaderRecompiler::IR::DescriptorValue& value);
+	void ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                    const ShaderRecompiler::IR::DescriptorValue& value, TextureBinding& binding);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -225,8 +223,6 @@ private:
 	// Guest ranges (address, size) written by the draw, gathered once per commit.
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
-	// Bindless tables bind the same descriptors draw after draw; decode each one once.
-	std::unordered_map<TextureDescKey, DecodedTextureDesc, TextureDescKeyHash> m_texture_descs;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
